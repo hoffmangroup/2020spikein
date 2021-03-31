@@ -14,21 +14,21 @@ library(scales)
 ##Function of the wanted plot
 ####Where x is the data points and y is the dataframe of means
 dist_plots <- function(x, y) {
-  # New facet label names for supp variable
-  facet_labs <- c("G+C: 35%", "G+C: 50%", "G+C: 65%")
-  names(facet_labs) <- c("35", "50", "65")
+# New facet label names for supp variable
+facet_labs <- c("G+C: 35%", "G+C: 50%", "G+C: 65%")
+names(facet_labs) <- c("35", "50", "65")
 
-  ggplot(x, aes(x = CpGfrac, y = n, group = variable)) +
-    geom_point(aes(color = methylation_status, shape = variable), size = 5) +
-    geom_point(data = y %>% filter(methylation_status == "unmethylated"),
-           mapping = aes(x = CpGfrac, y = means, group = methylation_status),
+ggplot(x, aes(x = cpg_frac, y = n, group = frag_grp)) +
+geom_point(aes(color = methylation_status, shape = variable), size = 5) +
+geom_point(data = y %>% filter(methylation_status == "unmethylated"),
+           mapping = aes(x = cpg_frac, y = means, group = methylation_status),
            pch = "—", col = "black", size = 10) +
-    geom_point(data = y %>% filter(methylation_status == "methylated"),
-           mapping = aes(x = CpGfrac, y = means, group = methylation_status),
+geom_point(data = y %>% filter(methylation_status == "methylated"),
+           mapping = aes(x = cpg_frac, y = means, group = methylation_status),
            pch = "—", col = "royalblue", size = 10) +
-  facet_grid(cols = vars(GC), labeller = labeller(GC = facet_labs)) +
-  theme_bw() +
-  theme(axis.title.y = element_text(size = 20),
+facet_grid(cols = vars(GC), scales = "free_x", labeller = labeller(GC = facet_labs)) +
+theme_bw() +
+theme(axis.title.y = element_text(size = 20),
       axis.text.x  = element_text(angle = 45, vjust = 0.5, size = 16),
       axis.text.y = element_text(vjust = 0.5, size = 16),
       axis.title.x = element_text(vjust = 0.5, size = 20),
@@ -37,13 +37,13 @@ dist_plots <- function(x, y) {
       strip.text.x = element_text(size = 16),
       plot.title =
         element_text(hjust = 0.5, color = "black", size = 14)) +
-  ylab("Number of unique reads") +
-  xlab("CpG fraction") +
-  theme(legend.position = "right") +
-  labs(color = "Methylation status", shape = "Sample") +
-  scale_colour_manual(values = c("deepskyblue3", "darkgrey")) +
-  scale_shape_manual(values = c(1, 2)) +
-  scale_y_continuous(labels = comma)
+ylab("Reads") +
+xlab("CpG fraction") +
+theme(legend.position = "right") +
+labs(color = "Methylation status", shape = "Sample") +
+scale_colour_manual(values = c("deepskyblue3", "darkgrey")) +
+scale_shape_manual(values = c(1, 2)) +
+scale_y_continuous(labels = comma)
 }
 
 ##Formatting data to what the input for the plot function needs to be
@@ -51,11 +51,6 @@ dist_plots <- function(x, y) {
   ###This is used to label the output plots
 data_wrang <- function(x) {
 ###Calculate CpG fraction
-x$cpg_frac <- as.factor(x$cpg / x$fragment_len)
-
-###revalue to make labels on plot nicer to read
-x$cpg_frac <- revalue(x$cpg_frac,
-                      c("0.0125" = "1/80", "0.025" = "1/40", "0.05" = "1/20"))
 x$methylation_status <- revalue(x$methylation_status,
                                 c("meth" = "methylated",
                                   "unmeth" = "unmethylated"))
@@ -81,7 +76,7 @@ data_320bp_melt <- melt(data_320bp,
                         id = c("fragment_len", "GC",
                                "cpg_frac", "methylation_status"),
                         measure.vars =
-                          grep("read_count_", colnames(data_160bp)))
+                          grep("read_count_", colnames(data_320bp)))
 
 ###revalue to make labels on plot nicer to read for each fragment length
 ###relabels sample number to "Sample 1" and "Sample 2"
@@ -147,6 +142,38 @@ return(list(data_80bp_totcount, data_80bp_means,
 data_01 <- read.table("2019_synfrag0.1_spikeincellline_dedup_lowconc.csv", header = T)
 data_005 <- read.table("2019_synfrag0.05_spikeincellline_dedup_lowconc.csv", header = T)
 data_001 <- read.table("2019_synfrag0.01_spikeincellline_dedup_lowconc.csv", header = T)
+
+#Cpg fraction
+data_0.1$cpg_frac <- as.factor(data_0.1$CpG / data_0.1$fragment_len)
+data_0.05$cpg_frac <- as.factor(data_0.05$CpG / data_0.05$fragment_len)
+data_0.01$cpg_frac <- as.factor(data_0.01$CpG / data_0.01$fragment_len)
+
+###revalue to make labels on plot nicer to read
+set_cpg_frac <- function(x) {
+                        revalue(x$cpg_frac,
+                      c("0.0125" = "1/80", "0.025" = "1/40", "0.05" = "1/20"))}
+
+data_0.1$cpg_frac <- set_cpg_frac(data_0.1)
+data_0.05$cpg_frac <- set_cpg_frac(data_0.05)
+data_0.01$cpg_frac <- set_cpg_frac(data_0.01)
+
+##Add two states for CpG fractions to visualize the replicate fragments better
+setDT(data_0.1)[frag_grp == "320_04_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.05)[frag_grp == "320_04_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.01)[frag_grp == "320_04_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_0.1)[frag_grp == "320_08_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.05)[frag_grp == "320_08_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.01)[frag_grp == "320_08_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_0.1)[frag_grp == "320_016_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.05)[frag_grp == "320_016_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_0.01)[frag_grp == "320_016_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+
+##Fix to the correct GC
+data_0.1$GC <- as.factor(str_sub(data_0.1$frag_grp,-2,-1))
+data_0.05$GC <- as.factor(str_sub(data_0.05$frag_grp,-2,-1))
+data_0.01$GC <- as.factor(str_sub(data_0.01$frag_grp,-2,-1))
 
 ##Extracting legend, so all plots are same size in the grid.arrange()
 #https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
@@ -254,7 +281,25 @@ dev.off()
 data_input <- read.table("~/Projects/2018_PTB/data/2019_TrimmedData_SynFragOly/2019_synfrag_input_dedup.csv", header = T)
 data_output <- read.table("~/Projects/2018_PTB/data/2019_TrimmedData_SynFragOly/2019_synfrag_output_dedup.csv", header = T)
 
+#Cpg fraction
+data_input$cpg_frac <- as.factor(data_input$CpG / data_input$fragment_len)
+data_output$cpg_frac <- as.factor(data_output$CpG / data_output$fragment_len)
+
+data_input$cpg_frac <- set_cpg_frac(data_input)
+data_output$cpg_frac <- set_cpg_frac(data_output)
+
+##Add two states for CpG fractions to visualize the replicate fragments better
+setDT(data_input)[frag_grp == "320_04_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320_04_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_input)[frag_grp == "320_08_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320_08_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_input)[frag_grp == "320_016_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320_016_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+
 ##input samples on miseq
+data_input$cpg_frac <- factor(data_input$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
 data_input_cleaned <- data_wrang(data_input)
 
 png("~/Projects/2018_PTB/data/2019_TrimmedData_SynFragOly/2019_input_miseq_plots.png",
@@ -285,6 +330,7 @@ grid.arrange(arrangeGrob(plot80_input + theme(legend.position = "none"),
 dev.off()
 
 ##output samples on miseq
+data_output$cpg_frac <- factor(data_output$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
 data_output_cleaned <- data_wrang(data_output)
 
 png("~/Projects/2018_PTB/data/2019_TrimmedData_SynFragOly/2019_output_miseq_plots.png",

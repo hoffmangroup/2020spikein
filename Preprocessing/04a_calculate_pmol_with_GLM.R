@@ -68,7 +68,7 @@ data_melt$fragment_len <- as.numeric(data_melt$fragment_len)
 ##Source the GLM from the control GLM code
 load("~/Projects/2020_Control_Project/2020_BatchAnalysis/Batch3_DT/2020_Gaussian_batch3.rda")
 
-print("start fmol prediction")
+print("start pmol prediction")
 ##Predict fmol values
 pred_conc <- as.data.frame(predict(gaussian_glm, data_melt))
 names(pred_conc) <- "value"
@@ -82,7 +82,7 @@ data_melt <- data_melt[, c("chr", "pos", "fragment_len", "UMI", "CpG", "CpG3", "
 print(head(data_melt))
 
     write.csv(data_melt, file = paste0("/cluster/projects/hoffmangroup/data_samanthawilson/",
-                                       file_path_sans_ext(basename(filename)), "_fmol.csv"))
+                                       file_path_sans_ext(basename(filename)), "_pmol.csv"))
 }
 
 args <-

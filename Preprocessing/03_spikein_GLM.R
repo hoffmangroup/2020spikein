@@ -82,6 +82,20 @@ data$GC <- revalue(data$GC, c("_35G-" = "35", "_50G-" = "50", "_65G-" = "65", "6
 data$frag_grp <- as.factor(paste0(data$fragment_len, sep = '_', data$CpG,sep = '_', data$GC))
 data$methylation_status <- NULL
 
+##Correcting the fragment names in the 320bp fragments
+data$frag_grp <- revalue(data$frag_grp, c("320_4_65" = "320_04_35"))
+data$frag_grp <- revalue(data$frag_grp, c("320_8_65" = "320_08_50"))
+data$frag_grp <- revalue(data$frag_grp, c("320_16_65" = "320_016_50"))
+
+##Fix to the correct GC
+data$GC <- as.factor(str_sub(data$frag_grp,-2,-1))
+
+data[is.na(data)] <- 0
+data <- data %>%
+  group_by(frag_grp, fragment_len, GC, CpG) %>%
+  summarise(read_count_6547 = sum(read_count_6547),
+            read_count_6548 = sum(read_count_6548))
+
 data[is.na(data)] <- 0
 
 data <- ddply(data,.(data$frag_grp, data$fragment_len, data$GC, data$CpG),numcolwise(sum), .progress = "text")
