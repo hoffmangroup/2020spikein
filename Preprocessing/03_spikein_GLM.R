@@ -26,22 +26,22 @@ S6654 <- subset(S6654, S6654$methylation_status == "meth")
 S6655 <- read.csv("filtered_aligned.trimmed.6655_S2_L002_R1_001.fastqtrimmed.6655_S2_L002_R2_001.fastq.bam_Cleaned_dedup_readcounts.csv", header = TRUE)
 S6655$S6655_read_count <- 1
 table(S6655$methylation_status) ##checking binding specificity
-S6654 <- subset(S6655, S6655$methylation_status == "meth")
+S6655 <- subset(S6655, S6655$methylation_status == "meth")
 
 S6656 <- read.csv("filtered_aligned.trimmed.6656_S3_L002_R1_001.fastqtrimmed.6656_S3_L002_R2_001.fastq.bam_Cleaned_dedup_readcounts.csv", header = TRUE)
 S6656$S6656_read_count <- 1
 table(S6656$methylation_status) ##checking binding specificity
-S6654 <- subset(S6656, S6656$methylation_status == "meth")
+S6656 <- subset(S6656, S6656$methylation_status == "meth")
 
 S6657 <- read.csv("filtered_aligned.trimmed.6657_S4_L002_R1_001.fastqtrimmed.6657_S4_L002_R2_001.fastq.bam_Cleaned_dedup_readcounts.csv", header = TRUE)
 S6657$S6657_read_count <- 1
 table(S6657$methylation_status) ##checking binding specificity
-S6654 <- subset(S6657, S6657$methylation_status == "meth")
+S6657 <- subset(S6657, S6657$methylation_status == "meth")
 
 S6658 <- read.csv("filtered_aligned.trimmed.6658_S5_L002_R1_001.fastqtrimmed.6658_S5_L002_R2_001.fastq.bam_Cleaned_dedup_readcounts.csv", header = TRUE)
 S6658$S6658_read_count <- 1
 table(S6658$methylation_status) ##checking binding specificity
-S6654 <- subset(S6658, S6658$methylation_status == "meth")
+S6658 <- subset(S6658, S6658$methylation_status == "meth")
 
 data <- merge(S6654, S6655, by = "UMI", all = TRUE)
 data <- data[,c(1:8,15)]
