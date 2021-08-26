@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-
+set -euo pipefail
+IFS=$'\n\t'
+set -e
+set -u
+set -o pipefail
+set -o nounset
+set -o errexit
 
 #Loading all needed modules
 ##This script was adapted from Roxana Shen's MEDIPS_PE_pipe.sh script by SLW
@@ -57,4 +63,14 @@ parallel -j 6 "samtools flagstat {1} 2> mappinginfo_{1/.}.log" ::: data/2019_Con
 
 ##Filtering reads to only those that were mater properly and counting the number of overlap between reads tha reference sequence (this should be read counts)
 parallel -j 6 "samtools view -bf 0x2 {1} > data/2019_ControlAlignment/filtered_{1/.}.bam" ::: data/2019_ControlAlignment/*.bam 
+
+#sort bam
+### This something has a parallelization issue, so watch that this is correct
+parallel -j 12 "samtools sort {1} {1.}_sorted" ::: /mnt/work1/users/home2/wilsons/Projects/2018_PTB/data/2019_ControlAlignment/*.bam 
+
+#index bam files
+parallel -j 12 "samtools index {1}" ::: /mnt/work1/users/home2/wilsons/Projects/2018_PTB/data/2019_ControlAlignment/*sorted.bam 
+
+##UMI dedup
+parallel -j 12 "umi_tools dedup -I {1} --paired -S {1.}_dedup.bam --output-stats={1.}_stats.tsv --mapping-quality=20 --unpaired-reads=discard --chimeric-pairs=discard --log={1.}.log" ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*sorted.bam
 
