@@ -1,0 +1,2436 @@
+---
+title: "Sensitive and reproducible cell-free methylome quantification with synthetic spike-in controls: Associated code"
+output:
+  rmdformats::html_clean:
+  self_contained: false
+fig_width: 15
+fig_height: 16
+thumbnails: false
+lightbox: true
+gallery: false
+cold_folding: true
+highlight: kate
+---
+  
+# Preprocessing 
+
+Scripts are ordered in the order in which they are used.
+While preprocessing scripts will point to one particular set of sample in the manuscript. The same scripts were used for all samples.
+
+## **01_fastp_bowtie2.sh**
+
+This script will assess quality of the reads using [fastqc](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/).
+
+Adapter trimming and extraction of unique molecular index (UMI) sequences are done using [fastp](https://academic.oup.com/bioinformatics/article/34/17/i884/5093234?login=true).
+
+Alignment to the human genome (hg38) and spike-in control sequences is completed with [Bowtie2](https://www.nature.com/articles/nmeth.1923?report=reader).
+The fasta file containing our synthetic DNA sequences is located in this github repository.
+
+UMI deduplication is performed with [UMI-tools](https://genome.cshlp.org/content/27/3/491.short).
+```{bash, eval = FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+set -e
+set -u
+set -o pipefail
+set -o nounset
+set -o errexit
+
+#Loading all needed modules
+##This script was adapted from Roxana Shen's MEDIPS_PE_pipe.sh script by SLW
+module load parallel
+#module load fastp/0.19.4
+module load fastqc/0.11.5
+module load bowtie2/2.3.5
+module load samtools/1.3.1
+module load picard/2.10.9  
+module load bedtools/2.27.1 
+module load igenome-human/hg38
+
+#mkdir data/2019_TrimmedControls/ #To store the trimmed files in later
+##Make sure this is storing data sile in the working directory and not on mordor
+
+#Checking to see what the quality of the unaligned reads are. 
+parallel -j 6 "fastqc -o data/2019_SpikeInControl_data --noextract -f fastq {1}" ::: data/2019_SpikeInControl_data/*.gz
+
+##fastp- trimming the adapters and appending UMI to sample same
+## -i input of read 1
+## -I input of read 2
+## -o output of read 1
+## -O output of read 2
+## --linksm read 1 and read 2
+## fastp automatically gzips outputs
+parallel -j 6 --link "fastp -i {1} -I {2} -o data/2019_TrimmedControls/trimmed.{1/} -O data/2019_TrimmedControls/trimmed.{2/} --umi --umi_loc=per_read --umi_len=5 --adapter_sequence=AATGATACGGCGACCACCGAGATCTACACATATGCGCACACTCTTTCCCTACACGAC --adapter_sequence_r2=CAAGCAGAAGACGGCATACGAGATACGATCAGGTGACTGGAGTTCAGACGTGT -j data/2019_TrimmedControls/{1/.}.{2/.}.json -h data/2019_TrimmedControls/{1/.}.{2/.}.html" ::: data/2019_SpikeInControl_data/*R1*fastq.gz ::: data/2019_SpikeInControl_data/*R2*fastq.gz
+
+##Align reads to reference genome
+### Create my own index to align to the synthetic fragment sequences located in the path where bowtie2 is located
+#bowtie2-build -f SyntheticDNA_seq.fasta  SyntheticDNA_idx
+
+### -f specifies the reference genome to be used, fastq file
+### -p specifies the number of threads to be used in parallelization
+### --minins specifies the minimum valid fragment length required for paired end sequence- I have removed a min, as I have 80bp control fragments I want to pick up.
+### --maxins specifies the maximum valid fragment length required for paired end sequence
+### -q specifies the input fastq read files to be aligned, -1 specified first mate pair, -2 specifies second mate pair
+### -S writes the alignment results to a sam file as output
+### --no-unal suppresses SAM files for reads that failed to align
+### --un will write unaligned reads to a fastq file
+
+#mkdir data/2019_ControlAlignment/ #To store both aligned and unaligned files
+
+##Aligns sequences to control fragments
+parallel -j 6 --link "bowtie2 --local -x ./SyntheticDNA_idx -p 6 --minins 80 --maxins 320 --no-unal --un-conc-gz data/2019_ControlAlignment/unalignedtospike.{1/} -q -1 {1} -2 {2} -S data/2019_ControlAlignment/aligned.{1/.}{2/.}.sam 2> data/2019_ControlAlignment/{1/.}_bowtie2.log"  ::: data/2019_TrimmedControls/*R1*.fastq.gz ::: data/2019_TrimmedControls/*R2*.fastq.gz  
+
+##Now align to remaining sequencing to the human genome 
+parallel -j 6 --link "bowtie2 --local -x $BOWTIE2INDEX -p 6 --minins 80 --maxins 320 -q -1 {1} -2 {2} -S data/2019_ControlAlignment/human.aligned.{1/.}{2/.}.sam 2> data/2019_ControlAlignment/{1/.}_bowtie2.log" ::: data/2019_ControlAlignment/unalignedtospike*fastq.1.gz ::: data/2019_ControlAlignment/unalignedtospike*fastq.2.gz
+
+#Convert .sam to .bam files
+parallel -j 6 "samtools view -bSh {1} > data/2019_ControlAlignment/{1/.}.bam" ::: data/2019_ControlAlignment/*.sam 
+## I have not sorted or indexed these files as they are synthetic DNA fragments not aligning to human genome, therefore have no coordinates. Because this is a small file, indexing is not needed.
+
+##Mapping info
+parallel -j 6 "samtools flagstat {1} 2> mappinginfo_{1/.}.log" ::: data/2019_ControlAlignment/*.bam
+
+##Filtering reads to only those that were mater properly and counting the number of overlap between reads tha reference sequence (this should be read counts)
+parallel -j 6 "samtools view -bf 0x2 {1} > data/2019_ControlAlignment/filtered_{1/.}.bam" ::: data/2019_ControlAlignment/*.bam 
+
+#sort bam
+### This something has a parallelization issue, so watch that this is correct
+parallel -j 12 "samtools sort {1} {1.}_sorted" ::: /mnt/work1/users/home2/wilsons/Projects/2018_PTB/data/2019_ControlAlignment/*.bam 
+
+#index bam files
+parallel -j 12 "samtools index {1}" ::: /mnt/work1/users/home2/wilsons/Projects/2018_PTB/data/2019_ControlAlignment/*sorted.bam 
+
+##UMI dedup
+parallel -j 12 "umi_tools dedup -I {1} --paired -S {1.}_dedup.bam --output-stats={1.}_stats.tsv --mapping-quality=20 --unpaired-reads=discard --chimeric-pairs=discard --log={1.}.log" ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*sorted.bam
+```
+
+## **02_GLM_spikes.R**
+
+The script takes the spike-in control bed files and assess methylation specificity and uses read counts, fragment length, G+C content, and number of CpGs in fragment to create a gaussian generalized linear model to calculate molar amount of cell-free DNA in picomoles.
+
+```{r, eval = FALSE}
+#!/usr/bin/env R
+
+#Load libraries
+library(rmarkdown)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(boot)
+library(BlandAltmanLeh)
+library(scales)
+library(stringr)
+library(forcats)
+library(ggpubr)
+
+##Load data
+
+S6547 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6547_S3_L_R1_001.fastqtrimmed.6547_S3_L_R2_001.fastq_sorted_dedup_sort.bed")
+S6547 <- as.data.frame(S6547[,1])
+colnames(S6547) <- c("frag_grp")
+
+#Assess methylation specificity and subset to only methylated fragments for GLM
+S6547$methylation_status <- str_extract(S6547$frag_grp, "meth")
+S6547$methylation_status <- S6547$methylation_status %>% fct_explicit_na(na_level = 'unmeth')
+
+print(sum(S6547$methylation_status == "meth")/nrow(S6547))
+# 0.9724638
+
+S6547 <- subset(S6547, S6547$methylation_status == "meth")
+S6547$methylation_status <- droplevels(S6547$methylation_status)
+S6547$S6547_read_count <- 1
+
+#Aggregate by spike-in control fragment (frag_grp)
+S6547 <- S6547 %>%
+        group_by(frag_grp) %>%
+        summarise(S6547_read_count = sum(S6547_read_count))
+
+S6548 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6548_S4_L_R1_001.fastqtrimmed.6548_S4_L_R2_001.fastq_sorted_dedup_sort.bed")
+S6548 <- as.data.frame(S6548[,1])
+colnames(S6548) <- c("frag_grp")
+
+#Assess methylation specificity and subset to only methylated fragments for GLM
+S6548$methylation_status <- str_extract(S6548$frag_grp, "meth")
+S6548$methylation_status <- S6548$methylation_status %>% fct_explicit_na(na_level = 'unmeth')
+
+print(sum(S6548$methylation_status == "meth")/nrow(S6548))
+#0.9783167
+
+S6548 <- subset(S6548, S6548$methylation_status == "meth")
+S6548$methylation_status <- droplevels(S6548$methylation_status)
+S6548$S6548_read_count <- 1
+
+#Aggregate by spike-in control fragment (frag_grp)
+S6548 <- S6548 %>%
+        group_by(frag_grp) %>%
+        summarise(S6548_read_count = sum(S6548_read_count))
+
+
+##merge
+data <- merge(S6547, S6548, by= "frag_grp", all = TRUE)
+
+##fill in NAs from UMI data
+data$fragment_len <- as.factor(str_sub(data$frag_grp, 0, 3))
+data$fragment_len <- revalue(data$fragment_len, c("80b" = "80"))
+
+data$CpG <- as.factor(str_sub(data$frag_grp, 5, 7))
+data$CpG <- revalue(data$CpG, c("_16" = "16","_2C" = "2","_4C" = "4","_8C" = "8","1C_" = "1","2C_" = "2","4C_" = "4"))
+
+data$GC <- as.factor(str_sub(data$frag_grp, 7, 11))
+data$GC <- revalue(data$GC, c("_35G-" = "35", "_50G-" = "50", "_65G-" = "65", "6C_35" = "35", "6C_50" = "50", "6C_65"="65", "C_35G"="35", "C_50G" = "50", "C_65G" = "65"))
+
+data$grp <- as.factor(paste0(data$fragment_len, sep = '_', data$CpG,sep = '_', data$GC))
+
+##since initial 320bp, 65% G+C is not correct, let's correct that to correct G+C content
+data$grp <- revalue(data$grp, c("320_4_65" = "320_04_35"))
+data$grp <- revalue(data$grp, c("320_8_65" = "320_08_50"))
+data$grp <- revalue(data$grp, c("320_16_65" = "320_016_50"))
+
+##Fix to the correct GC
+data$GC <- as.factor(str_sub(data$grp,-2,-1))
+
+data <- as.data.frame(data)
+
+##Add in concentration information
+for (i in 1:nrow(data)){
+  data[i,8] <- ifelse (data[i,4] == "160", 0.002, ifelse(data[i,4] == "80", 0.004, 0.001))
+}
+
+names(data)[8] <- "conc"
+
+##Adjusting for the 0.01ng dilution
+data$conc <- data$conc*0.9
+
+##Some exploratory plots
+###Melt so that data frame 
+data_melt <- melt(data, id.vars = c("conc", "grp", "GC", "CpG", "fragment_len"), measure.vars = c("S6547_read_count", "S6548_read_count"))
+data_melt$value <- as.numeric(as.character(data_melt$value))
+
+png("2020_concvsreads_dedup_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+ggplot(data_melt, aes(x = conc, y = value)) + geom_point() +
+  theme_bw()+
+  theme(axis.title = element_text(size = 20), axis.text.x  = element_text(angle = 45, vjust = 0.5, size = 12), axis.text.y = element_text(vjust = 0.5, size = 12))+
+  xlab("Concentration (pmol/ng)")+
+  ylab("Read counts")+
+  scale_y_continuous(labels = comma)+
+  scale_fill_manual("slategray3")
+dev.off()
+
+##Colour points by GC content
+data$GC <- as.factor(data$GC)
+
+png("2020_concvsreads_dedup_GCcol_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+ggplot(data_melt, aes(x = conc, y = value, col = GC)) + geom_point() +
+  theme_bw()+
+  theme(axis.title = element_text(size = 20), axis.text.x  = element_text(angle = 45, vjust = 0.5, size = 12), axis.text.y = element_text(vjust = 0.5, size = 12))+
+  xlab("Concentration (pmol/ng)")+
+  ylab("Read counts")+
+  scale_y_continuous(labels = comma)
+dev.off()
+
+data$GC <- as.numeric(as.character(data$GC))
+
+##Correlation between read count and concentration
+cor(data_melt$conc, data_melt$value)#-0.0956277
+
+##Cube root CpG to try to return distribution to normality
+data$CpG <- as.integer(as.character(data$CpG))
+data$CpG_3 <- data$CpG ^(1/3)
+
+##cube root
+data_sub <- data[, c("frag_grp", "S6547_read_count", "S6548_read_count", "fragment_len", "CpG_3", "GC", "conc")]
+data_melt <- melt(data_sub, id.vars = c("conc", "fragment_len", "CpG_3", "GC", "frag_grp"), measure.vars = c("S6547_read_count", "S6548_read_count"))
+data_melt$value <- as.numeric(as.character(data_melt$value))
+
+png("2020_CpG_3_dedup_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+ggplot(data = data_melt, aes(x = CpG_3, y = value, width = 0.1)) +
+  geom_bar(stat = "identity", fill = "peachpuff") +
+  theme_bw() +
+  theme(axis.title = element_text(size = 20), axis.text.x  = element_text(angle = 45, vjust = 0.5, size = 12), axis.text.y = element_text(vjust = 0.5, size = 12)) +
+  xlab("Number of CpGs") +
+  ylab("Read counts") +
+  scale_y_continuous(labels = comma, limits = c(0, 80000), breaks = c(20000, 40000, 60000, 80000))
+dev.off()
+#better, this will be used
+
+###Let's try out some models now
+data$fragment_len <- as.numeric(as.character(data$fragment_len))
+data$GC <- as.numeric(as.character(data$GC))
+
+data_sub <- data[, c("frag_grp", "S6547_read_count", "S6548_read_count", "fragment_len", "CpG_3", "GC", "conc")]
+data_melt <- melt(data_sub, id.vars = c("conc", "fragment_len", "CpG_3", "GC", "frag_grp"), measure.vars = c("S6547_read_count", "S6548_read_count"))
+data_melt$value <- as.numeric(as.character(data_melt$value))
+
+##Set ggplot theme
+theme_set(theme_bw() +
+  theme(legend.title = element_blank(), legend.position = "right", legend.text = element_text(size = 14),
+        axis.title.y = element_text(size = 20), axis.text.x  = element_text(size = 16),
+        axis.text.y = element_text(vjust = 0.5, size = 16),axis.title.x = element_text(size = 20))
+)
+
+
+#Make sure the data is in correct format before modelling
+stopifnot(str(data_melt$fragment_len) == "num")
+stopifnot(str(data$CpG) == "num")
+stopifnot(str(data_melt$CpG_3) == "num")
+stopifnot(str(data_melt$GC) == "num")
+
+##Poisson
+###Poisson- Getting negatives
+poisson_glm <- glm(formula = conc ~ value + fragment_len + GC + CpG_3, data = data_melt, family = poisson(link = "log"))
+summary(poisson_glm)#In dpois(y, mu, log = TRUE) : non-integer x = 0.000842
+
+##Calculate R2
+r2_poisson <- 1 - (poisson_glm$deviance / poisson_glm$null.deviance)
+r2_poisson # 0.9829384
+
+png("2020_GLM_fraglen_CpG3_0.01ngdiag.png")
+glm.diag.plots(poisson_glm, glmdiag = glm.diag(poisson_glm))
+dev.off()
+
+png("2020_GLM_fraglen_CpG3_poisson_0.01ng.png")
+plot(poisson_glm)
+dev.off()
+
+png("2020_BA_poisson_fraglen_CpG3_0.01ng.png")
+bland.altman.plot(poisson_glm$data[,1], poisson_glm$resid, conf.int=.95, pch=19) ##Why are there negative values here
+dev.off()
+
+poisson_glm$data[,8] <- as.factor(as.character(poisson_glm$data[, 2]))
+names(poisson_glm$data[,8]) <- "Fragment_len"
+
+png("2020_BA_poisson_fraglen_CpG3_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+BA <- bland.altman.plot(poisson_glm$data[,1], poisson_glm$resid, conf.int = .95, col.points = poisson_glm$data[,2], pch = 19, graph.sys = "ggplot2") 
+  
+BA + 
+  xlab("Mean of measurements (femotomoles)") +
+  ylab("Difference (picomoles)") +
+  stat_cor(method = "spearman", label.x.npc = "left", label.y = c(-0.05, -0.06, -0.07)) + 
+  aes(color = poisson_glm$data[,8]) + 
+  scale_color_manual(values = c("black", "darkgrey", "navy"))
+
+dev.off()
+
+###Gaussian
+gaussian_glm <- glm(formula = conc ~ value + fragment_len + GC + CpG_3, data = data_melt, family = gaussian)
+summary(gaussian_glm)
+
+png("2020_GLM_gaussian_fraglen_CpG3_0.01ngdiag.png")
+glm.diag.plots(gaussian_glm, glmdiag = glm.diag(gaussian_glm))
+dev.off()
+
+png("2020_GLM_fraglen_CpG3_gaussian0.01ng.png")
+plot(gaussian_glm)
+dev.off()
+
+png("2020_BA_gaussian_fraglen_CpG30.01ng.png")
+bland.altman.plot(gaussian_glm$data[,1], gaussian_glm$resid, conf.int=.95, pch=19)
+dev.off()
+
+gaussian_glm$data[,8] <- as.factor(as.character(gaussian_glm$data[, 2]))
+names(gaussian_glm$data[,8]) <- "Fragment_len"
+
+png("2020_BA_gaussian_fraglen_CpG3_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+BA <- bland.altman.plot(gaussian_glm$data[,1], gaussian_glm$resid, conf.int = .95, col.points = gaussian_glm$data[,2], pch = 19, graph.sys = "ggplot2")
+
+BA +
+  xlab("Mean of measurements (femotomoles)") +
+  ylab("Difference (picomoles)") +
+  stat_cor(method = "spearman", label.x = 0.001, label.y = c(-0.0015, -0.0018, -0.0021)) +
+  aes(color = gaussian_glm$data[,8]) + 
+  scale_color_manual(values = c("black", "darkgrey", "navy"))
+
+dev.off()
+
+##This estimates the 160bp very nicely
+
+##Calculate R2
+r2_gaussian= 1-(gaussian_glm$deviance/gaussian_glm$null.deviance)
+r2_gaussian #0.9429097
+
+##Correlation isn't great, but makes sense in the context of wanting 160bp to perform better, best AIC I've seen
+save(gaussian_glm, file = "2020_Gaussian_0.01ng.rda")
+
+###Gaussian log
+gaussian_log <- glm(formula = conc ~ value + fragment_len + GC + CpG_3, data = data_melt, family = gaussian(link = "log"))
+summary(gaussian_log)
+
+png("2020_GLM_gaussianlog_fraglen_CpG3_diag_0.01ng.png")
+glm.diag.plots(gaussian_log, glmdiag = glm.diag(gaussian_log))
+dev.off()
+
+png("2020_GLM_gaussianlog_fraglen_CpG3_0.01ng.png")
+plot(gaussian_log)
+dev.off()
+
+##Bland-Altman plot (plots the residuals against the truth and looks at the deviance)
+#gaussian_log$data[,2]=as.factor(as.character(gaussian_log$data[,2]))
+gaussian_log$data[,8] <- as.factor(as.character(gaussian_log$data[,2]))
+names(gaussian_log$data[,8]) <- "Fragment_len"
+
+png("2020_BA_guassianlog_fraglen_CpG3_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+BA <- bland.altman.plot(exp(gaussian_log$data[,1]), gaussian_log$resid, conf.int = .95, col.points = gaussian_log$data[,2], pch = 19, graph.sys="ggplot2")
+
+BA +
+  xlab("Mean of measurements (femotomoles)") +
+  ylab("Difference (picomoles)") +
+  stat_cor(method = "spearman", label.x.npc = "left", label.y = c(0.9, 0.88, 0.86)) +
+  aes(color = gaussian_log$data[,8]) + 
+  scale_color_manual(values = c("black", "darkgrey", "navy"))
+
+dev.off()
+
+##Calculate R2
+r2_gaussian_log = 1-(gaussian_log$deviance/gaussian_log$null.deviance)
+r2_gaussian_log #0.9848901
+
+##Seeing if a simple lm would perform better
+lm <- lm(conc ~ value + fragment_len + GC + CpG_3, data = data_melt)
+summary(lm)#R2=0.9343, adjusted=0.9287 
+##residual standard error -0.0005083
+
+png("2020_lm_fraglen_CpG3_0.01ng.png")
+plot(lm)
+dev.off()
+
+png("2020_lm_fraglen_CpG3_diag_0.01ng.png")
+glm.diag.plots(lm, glmdiag = glm.diag(lm))
+dev.off()
+
+png("2020_BA_lm_fraglen_CpG3_0.01ng.png")
+bland.altman.plot(lm$model[,1], lm$resid, conf.int=.95, pch=19)
+dev.off()
+
+lm$model[,6] <- as.factor(as.character(lm$model[,3]))
+names(lm$model[,6]) <- "Fragment_len"
+
+png("2020_BA_lm_fraglen_CpG3_0.01ng.png", height = 6, width = 6, units = "in", res = 300)
+BA <- bland.altman.plot(lm$model[,1], lm$residuals, conf.int = .95, pch = 19, graph.sys="ggplot2")
+
+BA +
+  xlab("Mean of measurements (picomoles)") +
+  ylab("Difference (picomoles)") +
+  stat_cor(method = "spearman", label.x = 0.0012, label.y = c(0.0016, 0.0014, 0.0012)) +
+  aes(color = as.factor(lm$model[, 3])) +    
+  scale_color_manual(values = c("black", "darkgrey", "navy"))
+
+dev.off()
+
+save(lm, file = "2020_lm_0.01ng.rda")
+```
+
+## **03a_calc_frag_params.sh**
+
+This script obtains the coordinates for the cell-free DNA fragment and gets the DNA sequence for that genomics region.
+I use bedtools nuc to calculate the fragment length, G+C content, and number of CpGs within a fragment.
+
+```{bash, eval = FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+set -e
+set -u
+set -o pipefail
+set -o nounset
+set -o errexit
+
+#Loading all needed modules
+module load parallel
+module load samtools
+module load bedtools
+
+#convert deduplicated bam to bedpe
+parallel -j 12 "samtools sort -n {1} -o {1.}_sort.bam" ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*dedup.bam
+
+#convert deduplicated bam to bedpe
+parallel -j 12 "bedtools bamtobed -bedpe -i {1}" ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*dedup.bam
+
+#cut hg38 aligned bed file to only to read 1 start and read 2 end
+parallel -j 6 "cut -f1-2,6,7,11- {1} > {1.}_cut.bed" ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_human*.bed
+
+#calculate GC content, fragment length, and CpG number
+## As some CG are capital and some not, I do this twice
+
+parallel -j 6 "bedtools nuc -fi /cluster/projects/hoffmangroup/data_samanthawilson/2020_PTB_secondtri/hg38.fa -bed {1} -pattern CG > {1.}_CG.bed " ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*_cut.bed
+
+parallel -j 6 "bedtools nuc -fi /cluster/projects/hoffmangroup/data_samanthawilson/2020_PTB_secondtri/hg38.fa -bed {1} -pattern CG > {1.}_cg.bed " ::: /cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/*_cut.bed
+```
+
+## **03b_restructure_frag_params.sh**
+
+This script combines the information for number of CpGs within a fragment to one file.
+
+This script may not need to be run if you do not have an issue with case sensititvity. 
+
+If you do not know whether there is a case sensitivity issue, run this script and there is a check in the *04_predict_pmol.R* script.
+
+```{bash, eval = FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+set -e
+set -u
+set -o pipefail
+set -o nounset
+set -o errexit
+
+module load parallel
+
+##Check that the first 3 rows match between the files
+parallel -j 6 "awk '{k=$1 FS $2 FS $3 FS $4} NR==FNR{a[k]; next} !(k in a)' {1} {2}" ::: ~/Projects/2018_PTB/data/2019_ControlAlignment/*CG.bed ::: ~/Projects/2018_PTB/data/2019_ControlAlignment/*cg.bed
+##event not found, they should match
+
+##Paste last column of cg file to the CG file
+parallel -j 1 "cut -f14-14 {1} > {1.}_tmp.bed" ::: ~/Projects/2018_PTB/data/2019_ControlAlignment/*cg.bed
+
+parallel -j 1 "paste {1} {2} > {1.}_all.bed" ::: ~/Projects/2018_PTB/data/2019_ControlAlignment/*CG.bed ::: ~/Projects/2018_PTB/data/2019_ControlAlignment/*tmp.bed
+
+##Make sure to delete tmp files after to save storage
+```
+  
+## **04_predict_pmol.R**
+
+This script takes the fragment aligned to the human genome and their read count, fragment length, G+C content, and CpG number and calculates the molar amount in picomoles using guassian generalized linear model obtained from *02_GLM_spikes.R*
+
+```{r, eval = FALSE}
+#!/usr/bin/env Rscript
+
+#Load libraries
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(stringr)
+library(varhandle)
+library(forcats)
+library(purrr)
+library(stringi)
+library(tools)
+
+main <- function(filename) {
+	data <- read.table(filename, sep = "\t", stringsAsFactors = TRUE, fill = TRUE)
+	data <- data[,c(1:3, 6,13:15)]
+	colnames(data) <- c("chr", "start", "end", "GC", "fragment_len", "CpG1", "CpG2")
+
+	 ##CpGs have been read in as levels - make sure they are numeric
+        data$CpG1 <- as.numeric(as.character(data$CpG1))
+        data$CpG2 <- as.numeric(as.character(data$CpG2))
+
+        #Check if CpG1 and CpG2 columns match - if they do, case sentivity in bedtools was not a problem and we only need one column
+        #Otherwise, we need to add the columns together 
+        if (data$CpG1 == data$CpG2) {data$CpG <- data$CpG1} else {data$CpG <- data$CpG1 + data$CpG2}
+
+        print(head(data))
+        print(str(data))
+        
+	##define read count as 1 per line
+	data$read_count <- 1
+
+	### remove uncharacterized genomic regions
+	data <- as.data.frame(data[!grepl("*KI*", data$chr), ])
+	data <- as.data.frame(data[!grepl("*GL*", data$chr), ])
+	data <- as.data.frame(data[!grepl("*EBV*", data$chr), ])
+	data <- as.data.frame(data[!grepl("*Un*", data$chr), ])
+
+	data_melt <- melt(data,
+                  id.vars = c("GC","fragment_len", "CpG", "chr", "start", "end"),
+                  measure.vars = "read_count")
+	data_melt$value <- as.numeric(as.character(data_melt$value))
+
+	data_melt$CpG_3 <- (data_melt$CpG) ^ (1 / 3)
+
+	data_melt$fragment_len <- as.numeric(data_melt$fragment_len)
+        data_melt$GC <- as.numeric(data_melt$GC)
+        data_melt$CpG <- as.numeric(data_melt$CpG)
+
+        stopifnot(str(data_melt$fragment_len) == "num")
+        stopifnot(str(data_melt$GC) == "num")
+        stopifnot(str(data_melt$CpG) == "num")
+
+	##Source the GLM from the control GLM code
+	load("/mnt/work1/users/home2/wilsons/Projects/2018_PTB/data/2019_ControlAlignment/2020_Gaussian_0.01ng.rda")
+
+	print("start pmol prediction")
+
+	##Predict fmol values
+	pred_conc <- as.data.frame(predict(gaussian_glm, data_melt))
+	names(pred_conc) <- "value"
+	
+	 ##Replace value with conc
+        data_melt$read_count<- data_melt$value 
+        data_melt$value <- NULL
+        data_melt <- cbind(data_melt, pred_conc)
+        data_melt$variable <- NULL
+        colnames(data_melt) <- c("GC","fragment_len", "CpG", "chr", "start", "end", "CpG_3", "read_count", "pmol")
+
+	print(head(data_melt))
+
+	#restructure to bed file format
+        data_melt <- data_melt[, c("chr", "start", "end", "fragment_len", "GC", "CpG", "CpG_3", "read_count", "pmol")]
+        print(head(data_melt))
+
+	write.table(data_melt, spe = "\t", row.names = FALSE, quote = FALSE, file = paste0("~/Projects/2018_PTB/data/2019_ControlAlignment/",
+                                       file_path_sans_ext(basename(filename)), "_pmol.bed"))
+
+}
+
+args <-
+if (length(commandArgs(TRUE))
+    || commandArgs()[length(commandArgs())] == "--args") {
+    as.list(commandArgs(TRUE))
+} else {
+    list()
+}
+
+ do.call(main, args)
+```
+
+## **05a_overlap_hg38_300bpwindows.sh**
+
+This script takes each of the fragments aligned to the human genome and the calculated molar amount and idenifies which 300bp windows each fragment overlaps. 
+
+```{bash, eval = FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+set -e
+set -u
+set -o pipefail
+set -o nounset
+set -o errexit
+
+##Find the overlaps between our fragments and each of the 300bp windows in genom
+### Retrun a file with the fragment listed, the concentration value for each sample, the window it overlaps and the number of basepairs that it overlaps
+
+module load bedtools
+module load parallel
+
+
+parallel -j 6 "bedtools intersect -wao -a {1} -b /cluster/home/wilsons/Projects/2020_Control_Project/2020_BatchAnalysis/2020_hg38_300bpwindows.bed > {1.}_hg38_intersect.bed" ::: /cluster/projects/hoffmangroup/data_samanthawilson/*pmol.bed
+```
+
+## **05b_adjust_pmol_to300bp.R**
+
+This final preprocessing script adjusts the molar amount (picomoles) value to account for the proportion of the fragment that overlaps each 300bp window.
+
+```{r, eval = FALSE}
+#!/usr/bin/env Rscript
+
+##Load packages
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(stringr)
+library(varhandle)
+library(forcats)
+library(purrr)
+library(stringi)
+library(tidyverse)
+library(tools)
+
+main <- function(filename) {
+
+##Load in data
+data <- read.table(filename, sep = "\t" , stringsAsFactors = TRUE, fill = TRUE)
+colnames(data) <- c("chr_frag", "start_frag", "end_frag", "fragment_len", "GC", "CpG", "CpG_3", "read_count", "pmol", "chrom", "chromStart", "chromEnd", "overlap_bp")
+
+###Adjust the methylation values (overlaps/300*conc)
+window_size <- 300
+
+data$multipler <- data$overlap_bp/window_size
+
+samples <- data[ , grepl( "pmol" , names(data))]
+adj_vals <- samples*data$multipler
+
+data_adj <- cbind(data[,c("chrom", "chromStart", "chromEnd", "read_count")],adj_vals)
+
+#Aggregate by window
+##sum pmol and read
+data_adj$read_count <- as.numeric(data_adj$read_count)
+data_adj_binned <- ddply(data_adj, .(data_adj$chrom, data_adj$chromStart, data_adj$chromEnd), numcolwise(sum))
+
+print(head(data_adj_binned))
+
+write.table(data_adj_binned, sep = "\t", row.names = FALSE, quote = FALSE, file = paste0("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/",
+                                       file_path_sans_ext(basename(filename)), "_adjbinned.bed"))
+
+}
+
+args <-
+if (length(commandArgs(TRUE))
+    || commandArgs()[length(commandArgs())] == "--args") {
+    as.list(commandArgs(TRUE))
+} else {
+    list()
+}
+
+ do.call(main, args)
+```
+
+# Analyses
+
+## **01_distribution_plots.R**
+
+This script looks at the distribution of read counts associated with fragment length, G+C content, and number of CpGs in a fragment in input and output samples where sample contains only the spike-in control fragments, and in experiment where 0.01ng of spike-in DNA was added  to 9.9ng of HCT116 sheared DNA.
+
+```{r, eval = FALSE}
+#!/user/bin/env Rscript
+
+#Load libraries
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(stringr)
+library(varhandle)
+library(forcats)
+library(scales)
+library(data.table)
+
+##Function of the wanted plot
+####Where x is the data points and y is the dataframe of means
+dist_plots <- function(x, y) {
+# New facet label names for supp variable
+facet_labs <- c("G+C: 35%", "G+C: 50%", "G+C: 65%")
+names(facet_labs) <- c("35", "50", "65")
+
+ggplot(x, aes(x = cpg_frac, y = value, group = frag_grp)) +
+geom_point(aes(color = methylation_status, shape = variable), size = 5) +
+geom_point(data = y %>% filter(methylation_status == "unmethylated"),
+           mapping = aes(x = cpg_frac, y = means, group = methylation_status),
+           pch = "—", col = "black", size = 10) +
+geom_point(data = y %>% filter(methylation_status == "methylated"),
+           mapping = aes(x = cpg_frac, y = means, group = methylation_status),
+           pch = "—", col = "royalblue", size = 10) +
+facet_grid(cols = vars(GC), scales = "free", labeller = labeller(GC = facet_labs)) +
+theme_bw() +
+theme(axis.title.y = element_text(size = 20),
+      axis.text.x  = element_text(angle = 45, vjust = 0.5, size = 16),
+      axis.text.y = element_text(vjust = 0.5, size = 16),
+      axis.title.x = element_text(vjust = 0.5, size = 20),
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      strip.text.x = element_text(size = 16),
+      plot.title =
+        element_text(hjust = 0.5, color = "black", size = 14)) +
+ylab("Reads") +
+xlab("CpG fraction") +
+theme(legend.position = "right") +
+labs(color = "Methylation status", shape = "Sample") +
+scale_colour_manual(values = c("deepskyblue3", "darkgrey")) +
+scale_shape_manual(values = c(1, 2)) +
+scale_y_continuous(labels = comma) + 
+scale_x_discrete(limits = levels(x$fragment_grp))
+}
+
+##Formatting data to what the input for the plot function needs to be
+###Specify the concentration of the data you are passing
+  ###This is used to label the output plots
+data_wrang <- function(x) {
+###Calculate CpG fraction
+x$methylation_status <- revalue(x$methylation_status,
+                                c("meth" = "methylated",
+                                  "unmeth" = "unmethylated"))
+
+##divide data into fragment length category
+data_80bp <- subset(x, x$fragment_len == "80")
+data_160bp <- subset(x, x$fragment_len == "160")
+data_320bp <- subset(x, x$fragment_len == "320")
+
+##melt data for each fragment length
+##each row is a read and variable lists the sample name
+data_80bp_melt <- melt(data_80bp,
+                       id = c("frag_grp", "fragment_len", "GC",
+                              "cpg_frac", "methylation_status"),
+                       measure.vars =
+                         grep("read_count", colnames(data_80bp)))
+data_160bp_melt <- melt(data_160bp,
+                        id = c("frag_grp", "fragment_len", "GC",
+                               "cpg_frac", "methylation_status"),
+                        measure.vars =
+                          grep("read_count", colnames(data_160bp)))
+data_320bp_melt <- melt(data_320bp,
+                        id = c("frag_grp", "fragment_len", "GC",
+                               "cpg_frac", "methylation_status"),
+                        measure.vars =
+                          grep("read_count", colnames(data_320bp)))
+
+###revalue to make labels on plot nicer to read for each fragment length
+###relabels sample number to "Sample 1" and "Sample 2"
+names <- as.matrix(unique(data_80bp_melt$variable))
+#Just pulls the unique sample names from any data frame
+relabel_samplenames <- function(sample_names,names){#relabels all samples
+  list_samples <- list()
+  for(i in 1:length(sample_names))
+  {
+    list_samples[[i]]=ifelse (sample_names[i]==names[1],paste0("Sample 1"),paste0("Sample 2"))
+  }
+  return(list_samples)
+}
+
+data_80bp_melt$variable <- do.call(rbind, relabel_samplenames(data_80bp_melt$variable, names))
+data_160bp_melt$variable <- do.call(rbind, relabel_samplenames(data_160bp_melt$variable, names))
+data_320bp_melt$variable <- do.call(rbind, relabel_samplenames(data_320bp_melt$variable, names))
+
+##Produce total counts for each grouping of fragment length
+data_80bp_totcount <- data_80bp_melt %>%
+  count(value, variable, frag_grp, cpg_frac, GC, methylation_status)
+###Produces total with all the total counts I need
+data_80bp_totcount <- na.omit(data_80bp_totcount)
+
+data_160bp_totcount <- data_160bp_melt %>%
+  count(value, variable, frag_grp, cpg_frac, GC, methylation_status)
+###Produces total with all the total counts I need
+data_160bp_totcount <- na.omit(data_160bp_totcount)
+
+data_320bp_totcount <- data_320bp_melt %>%
+  count(value, variable, frag_grp, cpg_frac, GC, methylation_status)
+###Produces total with all the total counts I need
+data_320bp_totcount <- na.omit(data_320bp_totcount)
+
+##Computing mean values for each fragment length group
+data_80bp_means <- data_80bp_totcount %>%
+        group_by(methylation_status, frag_grp, GC, cpg_frac) %>%
+        summarise(means = mean(value), mad = mad(value), min = min(value), max = max(value), diff = max(value) - min(value), .groups = 'keep')
+
+data_160bp_means <- data_160bp_totcount %>%
+        group_by(methylation_status, frag_grp, GC, cpg_frac) %>%
+        summarise(means = mean(value),  mad = mad(value), min = min(value), max = max(value), diff = max(value) - min(value), .groups = 'keep')
+
+data_320bp_means <- data_320bp_totcount %>%
+        group_by(methylation_status, frag_grp, GC, cpg_frac) %>%
+        summarise(means = mean(value),  mad = mad(value), min = min(value), max = max(value), diff = max(value) - min(value), .groups = 'keep')
+
+return(list(data_80bp_totcount, data_80bp_means,
+            data_160bp_totcount, data_160bp_means,
+            data_320bp_totcount, data_320bp_means))
+#Return a list of tibbles that are fragment length counts, and means
+}
+
+##Read in the files and add a column with sample name and specify read_counts column per sample
+##0.1ng spike-in
+S1_01 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6543_S7_L_R1_001.fastqtrimmed.6543_S7_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S1_01 <- S1_01[c(1:2)]
+colnames(S1_01) <- c("label", "S1_01_read_count")
+S1_01 <- S1_01 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+S2_01 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6544_S21_L_R1_001.fastqtrimmed.6544_S21_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S2_01 <- S2_01[c(1:2)]
+colnames(S2_01) <- c("label", "S2_01_read_count")
+S2_01 <- S2_01 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+data_0.1 <- merge(S1_01, S2_01, by = "label", all = TRUE, fill = TRUE)
+
+##0.05ng spike-in
+S1_005 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6545_S1_L_R1_001.fastqtrimmed.6545_S1_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S1_005 <- S1_005[c(1:2)]
+colnames(S1_005) <- c("label", "S1_005_read_count")
+S1_005 <- S1_005 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+S2_005 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6546_S2_L_R1_001.fastqtrimmed.6546_S2_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S2_005 <- S2_005[c(1:2)]
+colnames(S2_005) <- c("label", "S2_005_read_count")
+S2_005 <- S2_005 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+data_0.05 <- merge(S1_005, S2_005, by = "label", all = TRUE, fill = TRUE)
+
+##0.01ng spike-in
+S1_001 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6547_S3_L_R1_001.fastqtrimmed.6547_S3_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S1_001 <- S1_001[c(1:2)]
+colnames(S1_001) <- c("label", "S1_001_read_count")
+S1_001 <- S1_001 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+S2_001 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/filtered_aligned.trimmed.6548_S4_L_R1_001.fastqtrimmed.6548_S4_L_R2_001.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S2_001 <- S2_001[c(1:2)]
+colnames(S2_001) <- c("label", "S2_001_read_count")
+S2_001 <- S2_001 %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+data_0.01 <- merge(S1_001, S2_001, by = "label", all = TRUE, fill = TRUE)
+data_0.01[is.na(data_0.01)] <- 0
+
+#create methylation status and frag_grp
+data_0.1$frag_grp <- substr(data_0.1$label, 1, 10)
+
+data_0.1$methylation_status <- for (i in 1:nrow(data_0.1)) {
+				if (substr(data_0.1$label[i], (nchar(data_0.1$label)[i]+1)-4, nchar(data_0.1$label[i])) == "meth") {data_0.1[i,5] = "meth"}
+				else {data_0.1[i,5] = "unmeth"}}
+colnames(data_0.1) <- c("label", "S1_01_read_count", "S2_01_read_count", "frag_grp", "methylation_status")
+
+
+data_0.05$frag_grp <- substr(data_0.05$label, 1, 10)
+
+data_0.05$methylation_status <- for (i in 1:nrow(data_0.05)) {
+                                if (substr(data_0.05$label[i], (nchar(data_0.05$label)[i]+1)-4, nchar(data_0.05$label[i])) == "meth") {data_0.05[i,5] = "meth"}
+                                else {data_0.05[i,5] = "unmeth"}}
+colnames(data_0.05) <- c("label", "S1_005_read_count", "S2_005_read_count", "frag_grp", "methylation_status")
+
+data_0.01$frag_grp <- substr(data_0.01$label, 1, 10)
+
+data_0.01$methylation_status <- for (i in 1:nrow(data_0.01)) {
+                                if (substr(data_0.01$label[i], (nchar(data_0.01$label)[i]+1)-4, nchar(data_0.01$label[i])) == "meth") {data_0.01[i,5] = "meth"}
+                                else {data_0.01[i,5] = "unmeth"}}
+colnames(data_0.01) <- c("label", "S1_001_read_count", "S2_001_read_count", "frag_grp", "methylation_status")
+
+#clean up frag_grp
+data_0.1$frag_grp <- as.factor(data_0.1$frag_grp)
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_16C_3" = "320b_16C_35"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_16C_5" = "320b_16C_50"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_16C_6" = "320b_16C_65"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_1C_35G" = "80b_1C_35"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_1C_50G" = "80b_1C_50"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_1C_65G" = "80b_1C_65"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_2C_35G" = "80b_2C_35"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_2C_50G" = "80b_2C_50"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_2C_65G" = "80b_2C_65"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_4C_35G" = "80b_4C_35"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_4C_50G" = "80b_4C_50"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("80b_4C_65G" = "80b_4C_65"))
+
+data_0.05$frag_grp <- as.factor(data_0.05$frag_grp)
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_16C_3" = "320b_16C_35"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_16C_5" = "320b_16C_50"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_16C_6" = "320b_16C_65"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_1C_35G" = "80b_1C_35"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_1C_50G" = "80b_1C_50"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_1C_65G" = "80b_1C_65"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_2C_35G" = "80b_2C_35"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_2C_50G" = "80b_2C_50"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_2C_65G" = "80b_2C_65"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_4C_35G" = "80b_4C_35"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_4C_50G" = "80b_4C_50"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("80b_4C_65G" = "80b_4C_65"))
+
+data_0.01$frag_grp <- as.factor(data_0.01$frag_grp)
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_16C_3" = "320b_16C_35"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_16C_5" = "320b_16C_50"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_16C_6" = "320b_16C_65"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_1C_35G" = "80b_1C_35"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_1C_50G" = "80b_1C_50"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_1C_65G" = "80b_1C_65"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_2C_35G" = "80b_2C_35"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_2C_50G" = "80b_2C_50"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_2C_65G" = "80b_2C_65"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_4C_35G" = "80b_4C_35"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_4C_50G" = "80b_4C_50"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("80b_4C_65G" = "80b_4C_65"))
+
+##since initial 320bp, 65% G+C is not correct, let's correct that to correct G+C content
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_4C_65" = "320b_04C_35"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_8C_65" = "320b_08C_50"))
+data_0.1$frag_grp <- revalue(data_0.1$frag_grp, c("320b_16C_65" = "320b_016C_50"))
+
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_4C_65" = "320b_04C_35"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_8C_65" = "320b_08C_50"))
+data_0.05$frag_grp <- revalue(data_0.05$frag_grp, c("320b_16C_65" = "320b_016C_50"))
+
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_4C_65" = "320b_04C_35"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_8C_65" = "320b_08C_50"))
+data_0.01$frag_grp <- revalue(data_0.01$frag_grp, c("320b_16C_65" = "320b_016C_50"))
+
+#Cpg fraction
+data_0.1$CpG <- as.factor(substr(data_0.1$label, 4,7))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("_1C_" = "1"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("_2C_" = "2"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("_4C_" = "4"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("b_16" = "16"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("b_2C" = "2"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("b_4C" = "4"))
+data_0.1$CpG <- revalue(data_0.1$CpG, c("b_8C" = "8"))
+data_0.1$CpG <- as.numeric(as.character(data_0.1$CpG))
+
+data_0.05$CpG <- as.factor(substr(data_0.05$label, 4,7))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("_1C_" = "1"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("_2C_" = "2"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("_4C_" = "4"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("b_16" = "16"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("b_2C" = "2"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("b_4C" = "4"))
+data_0.05$CpG <- revalue(data_0.05$CpG, c("b_8C" = "8"))
+data_0.05$CpG <- as.numeric(as.character(data_0.05$CpG))
+
+data_0.01$CpG <- as.factor(substr(data_0.01$label, 4,7))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("_1C_" = "1"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("_2C_" = "2"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("_4C_" = "4"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("b_16" = "16"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("b_2C" = "2"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("b_4C" = "4"))
+data_0.01$CpG <- revalue(data_0.01$CpG, c("b_8C" = "8"))
+data_0.01$CpG <- as.numeric(as.character(data_0.01$CpG))
+
+data_0.1$fragment_len <- as.factor(substr(data_0.1$label, 1,3))
+data_0.1$fragment_len <- revalue(data_0.1$fragment_len, c("80b" = "80"))
+
+data_0.05$fragment_len <- as.factor(substr(data_0.05$label, 1,3))
+data_0.05$fragment_len <- revalue(data_0.05$fragment_len, c("80b" = "80"))
+
+data_0.01$fragment_len <- as.factor(substr(data_0.01$label, 1,3))
+data_0.01$fragment_len <- revalue(data_0.01$fragment_len, c("80b" = "80"))
+
+data_0.1$cpg_frac <- as.factor(as.numeric(data_0.1$CpG) / as.numeric(as.character(data_0.1$fragment_len)))
+data_0.05$cpg_frac <- as.factor(as.numeric(data_0.05$CpG) / as.numeric(as.character(data_0.05$fragment_len)))
+data_0.01$cpg_frac <- as.factor(as.numeric(data_0.01$CpG) / as.numeric(as.character(data_0.01$fragment_len)))
+
+###revalue to make labels on plot nicer to read
+set_cpg_frac <- function(x) {
+			revalue(x$cpg_frac,
+                      c("0.0125" = "1/80", "0.025" = "1/40", "0.05" = "1/20"))}
+
+data_0.1$cpg_frac <- set_cpg_frac(data_0.1)
+data_0.05$cpg_frac <- set_cpg_frac(data_0.05)
+data_0.01$cpg_frac <- set_cpg_frac(data_0.01)
+
+##Add two states for CpG fractions to visualize the replicate fragments better
+setDT(data_0.1)[frag_grp == "320b_04C_35" & cpg_frac == "1/80", cpg_frac := "1/81"]
+setDT(data_0.05)[frag_grp == "320b_04C_35" & cpg_frac == "1/80", cpg_frac := "1/81"]
+setDT(data_0.01)[frag_grp == "320b_04C_35" & cpg_frac == "1/80", cpg_frac := "1/81"]
+
+setDT(data_0.1)[frag_grp == "320b_08C_50" & cpg_frac == "1/40", cpg_frac := "1/41"]
+setDT(data_0.05)[frag_grp == "320b_08C_50" & cpg_frac == "1/40", cpg_frac := "1/41"]
+setDT(data_0.01)[frag_grp == "320b_08C_50" & cpg_frac == "1/40", cpg_frac := "1/41"]
+
+setDT(data_0.1)[frag_grp == "320b_016C_50" & cpg_frac == "1/20", cpg_frac := "1/21"]
+setDT(data_0.05)[frag_grp == "320b_016C_50" & cpg_frac == "1/20", cpg_frac := "1/21"]
+setDT(data_0.01)[frag_grp == "320b_016C_50" & cpg_frac == "1/20", cpg_frac := "1/21"]
+
+
+##Fix to the correct GC
+data_0.1$GC <- as.factor(str_sub(data_0.1$frag_grp,-2,-1))
+data_0.05$GC <- as.factor(str_sub(data_0.05$frag_grp,-2,-1))
+data_0.01$GC <- as.factor(str_sub(data_0.01$frag_grp,-2,-1))
+
+##Extracting legend, so all plots are same size in the grid.arrange()
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend <- function(a_gplot) {
+  tmp <- ggplot_gtable(ggplot_build(a_gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+  }
+
+##0.1ng spike-in
+levels(data_0.1$cpg_frac) <-  c("1/80", "1/40", "1/20", "1/80(2)", "1/40(2)", "1/20(2)")
+data_0.1$cpg_frac <- factor(data_0.1$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
+data_0.1_cleaned <- data_wrang(data_0.1)
+
+png("2021_0.1ng_plots.png",
+    height = 10, width = 24, units = "in", res = 300)
+plot80_0.1 <- dist_plots(as.data.frame(data_0.1_cleaned[1]), as.data.frame(data_0.1_cleaned[2])) +
+  ggtitle("Fragment length: 80 bp") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot160_0.1 <- dist_plots(as.data.frame(data_0.1_cleaned[3]), as.data.frame(data_0.1_cleaned[4])) +
+  ggtitle("Fragment length: 160 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot320_0.1 <- dist_plots(as.data.frame(data_0.1_cleaned[5]), as.data.frame(data_0.1_cleaned[6])) +
+  ggtitle("Fragment length: 320 bp") +
+theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+mylegend <- g_legend(plot80_0.1)
+grid.arrange(arrangeGrob(plot80_0.1 + theme(legend.position = "none"),
+                         plot160_0.1 + theme(legend.position = "none"), ncol = 2, nrow = 1),
+                         arrangeGrob(plot320_0.1 + theme(legend.position = "none"), ncol = 3.35,
+                         nrow = 1), mylegend, nrow = 2, heights = c(10, 1))
+dev.off()
+
+##0.05ng spike-in
+levels(data_0.05$cpg_frac) <-  c("1/80", "1/40", "1/20", "1/80(2)", "1/40(2)", "1/20(2)")
+data_0.05$cpg_frac <- factor(data_0.05$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
+data_0.05_cleaned <- data_wrang(data_0.05)
+
+png("2021_0.05ng_plots.png",
+    height = 10, width = 24, units = "in", res = 300)
+plot80_0.05 <- dist_plots(as.data.frame(data_0.05_cleaned[1]), as.data.frame(data_0.05_cleaned[2])) +
+  ggtitle("Fragment length: 80 bp") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot160_0.05 <- dist_plots(as.data.frame(data_0.05_cleaned[3]), as.data.frame(data_0.05_cleaned[4])) +
+  ggtitle("Fragment length: 160 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot320_0.05 <- dist_plots(as.data.frame(data_0.05_cleaned[5]), as.data.frame(data_0.05_cleaned[6])) +
+  ggtitle("Fragment length: 320 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+mylegend <- g_legend(plot80_0.05)
+grid.arrange(arrangeGrob(plot80_0.1 + theme(legend.position = "none"),
+                         plot160_0.1 + theme(legend.position = "none"), ncol = 2, nrow = 1),
+                         arrangeGrob(plot320_0.1 + theme(legend.position = "none"), ncol = 3.35,
+                         nrow = 1), mylegend, nrow = 2, heights = c(10, 1))
+dev.off()
+
+##0.01ng spike-in
+levels(data_0.01$cpg_frac) <-  c("1/80", "1/40", "1/20", "1/80(2)", "1/40(2)", "1/20(2)")
+data_0.01$cpg_frac <- factor(data_0.01$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
+data_0.01_cleaned <- data_wrang(data_0.01)
+save(data_0.01_cleaned, file = "2021_001ng_data.RData")
+
+png("2021_0.01ng_plots.png",
+    height = 10, width = 36, units = "in", res = 300)
+plot80_0.01 <- dist_plots(as.data.frame(data_0.01_cleaned[1]), as.data.frame(data_0.01_cleaned[2])) +
+  ggtitle("Fragment length: 80 bp") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot160_0.01 <- dist_plots(as.data.frame(data_0.01_cleaned[3]), as.data.frame(data_0.01_cleaned[4])) +
+  ggtitle("Fragment length: 160 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+plot320_0.01 <- dist_plots(as.data.frame(data_0.01_cleaned[5]), as.data.frame(data_0.01_cleaned[6])) +
+  ggtitle("Fragment length: 320 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000))
+mylegend <- g_legend(plot80_0.01)
+grid.arrange(arrangeGrob(plot80_0.01 + theme(legend.position = "none"),
+                         plot160_0.01 + theme(legend.position = "none"), ncol = 2, nrow = 1),
+                         arrangeGrob(plot320_0.01 + theme(legend.position = "none"), ncol = 2.5,
+                         nrow = 1), mylegend, nrow = 2, heights = c(10, 1))
+dev.off()
+
+##Load in the synthetic spike-in data on miseq
+S1_input <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2019_synfrag_only/filtered_aligned.trimmed.6427_S3.fastqtrimmed.6427_S3.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S1_input <- S1_input[c(1:2)]
+colnames(S1_input) <- c("label", "S1_input_read_count")
+S1_input <- S1_input %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+S2_input <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2019_synfrag_only/filtered_aligned.trimmed.6428_S4.fastqtrimmed.6428_S4.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S2_input <- S2_input[c(1:2)]
+colnames(S2_input) <- c("label", "S2_input_read_count")
+S2_input <- S2_input %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+data_input <- merge(S1_input, S2_input, by = "label", all = TRUE, fill = TRUE)
+data_input[is.na(data_input)] <- 0
+
+S1_output <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2019_synfrag_only/filtered_aligned.trimmed.6425_S1.fastqtrimmed.6425_S1.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S1_output <- S1_output[c(1:2)]
+colnames(S1_output) <- c("label", "S1_output_read_count")
+S1_output <- S1_output %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+S2_output <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2019_synfrag_only/filtered_aligned.trimmed.6426_S2.fastqtrimmed.6426_S2.fastq_sorted_dedup_sort.bed", sep = "\t", header = FALSE)
+S2_output <- S2_output[c(1:2)]
+colnames(S2_output) <- c("label", "S2_output_read_count")
+S2_output <- S2_output %>% group_by(label) %>% summarise_if(is.numeric, sum)
+
+data_output <- merge(S1_output, S2_output, by = "label", all = TRUE, fill = TRUE)
+data_output[is.na(data_output)] <- 0
+
+#create methylation status and frag_grp
+data_input$frag_grp <- substr(data_input$label, 1, 10)
+
+data_input$methylation_status <- for (i in 1:nrow(data_input)) {
+                                if (substr(data_input$label[i], (nchar(data_input$label)[i]+1)-4, nchar(data_input$label[i])) == "meth") {data_input[i,5] = "meth"}
+                                else {data_input[i,5] = "unmeth"}}
+colnames(data_input) <- c("label", "S1_input_read_count", "S2_input_read_count", "frag_grp", "methylation_status")
+
+data_output$frag_grp <- substr(data_output$label, 1, 10)
+
+data_output$methylation_status <- for (i in 1:nrow(data_output)) {
+                                if (substr(data_output$label[i], (nchar(data_output$label)[i]+1)-4, nchar(data_output$label[i])) == "meth") {data_output[i,5] = "meth"}
+                                else {data_output[i,5] = "unmeth"}}
+colnames(data_output) <- c("label", "S1_output_read_count", "S2_output_read_count", "frag_grp", "methylation_status")
+
+#Cpg fraction
+data_input$frag_grp <- as.factor(data_input$frag_grp)
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_16C_3" = "320b_16C_35"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_16C_5" = "320b_16C_50"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_16C_6" = "320b_16C_65"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_1C_35G" = "80b_1C_35"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_1C_50G" = "80b_1C_50"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_1C_65G" = "80b_1C_65"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_2C_35G" = "80b_2C_35"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_2C_50G" = "80b_2C_50"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_2C_65G" = "80b_2C_65"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_4C_35G" = "80b_4C_35"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_4C_50G" = "80b_4C_50"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("80b_4C_65G" = "80b_4C_65"))
+
+data_output$frag_grp <- as.factor(data_output$frag_grp)
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_16C_3" = "320b_16C_35"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_16C_5" = "320b_16C_50"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_16C_6" = "320b_16C_65"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_1C_35G" = "80b_1C_35"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_1C_50G" = "80b_1C_50"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_1C_65G" = "80b_1C_65"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_2C_35G" = "80b_2C_35"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_2C_50G" = "80b_2C_50"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_2C_65G" = "80b_2C_65"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_4C_35G" = "80b_4C_35"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_4C_50G" = "80b_4C_50"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("80b_4C_65G" = "80b_4C_65"))
+
+
+##since initial 320bp, 65% G+C is not correct, let's correct that to correct G+C content
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_4C_65" = "320b_04C_35"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_8C_65" = "320b_08C_50"))
+data_input$frag_grp <- revalue(data_input$frag_grp, c("320b_16C_65" = "320b_016C_50"))
+
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_4C_65" = "320b_04C_35"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_8C_65" = "320b_08C_50"))
+data_output$frag_grp <- revalue(data_output$frag_grp, c("320b_16C_65" = "320b_016C_50"))
+
+#Cpg fraction
+data_input$CpG <- as.factor(substr(data_input$label, 4,7))
+data_input$CpG <- revalue(data_input$CpG, c("_1C_" = "1"))
+data_input$CpG <- revalue(data_input$CpG, c("_2C_" = "2"))
+data_input$CpG <- revalue(data_input$CpG, c("_4C_" = "4"))
+data_input$CpG <- revalue(data_input$CpG, c("b_16" = "16"))
+data_input$CpG <- revalue(data_input$CpG, c("b_2C" = "2"))
+data_input$CpG <- revalue(data_input$CpG, c("b_4C" = "4"))
+data_input$CpG <- revalue(data_input$CpG, c("b_8C" = "8"))
+data_input$CpG <- as.numeric(as.character(data_input$CpG))
+
+data_output$CpG <- as.factor(substr(data_output$label, 4,7))
+data_output$CpG <- revalue(data_output$CpG, c("_1C_" = "1"))
+data_output$CpG <- revalue(data_output$CpG, c("_2C_" = "2"))
+data_output$CpG <- revalue(data_output$CpG, c("_4C_" = "4"))
+data_output$CpG <- revalue(data_output$CpG, c("b_16" = "16"))
+data_output$CpG <- revalue(data_output$CpG, c("b_2C" = "2"))
+data_output$CpG <- revalue(data_output$CpG, c("b_4C" = "4"))
+data_output$CpG <- revalue(data_output$CpG, c("b_8C" = "8"))
+data_output$CpG <- as.numeric(as.character(data_output$CpG))
+
+data_input$fragment_len <- as.factor(substr(data_input$label, 1,3))
+data_input$fragment_len <- revalue(data_input$fragment_len, c("80b" = "80"))
+
+
+data_output$fragment_len <- as.factor(substr(data_output$label, 1,3))
+data_output$fragment_len <- revalue(data_output$fragment_len, c("80b" = "80"))
+
+data_input$cpg_frac <- as.factor(as.numeric(data_input$CpG) / as.numeric(as.character(data_input$fragment_len)))
+data_output$cpg_frac <- as.factor(as.numeric(data_output$CpG) / as.numeric(as.character(data_output$fragment_len)))
+
+data_input$cpg_frac <- set_cpg_frac(data_input)
+data_output$cpg_frac <- set_cpg_frac(data_output)
+
+##Add two states for CpG fractions to visualize the replicate fragments better
+setDT(data_input)[frag_grp == "320b_04C_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320b_04C_35" & cpg_frac == "1/80", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_input)[frag_grp == "320b_08C_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320b_08C_50" & cpg_frac == "1/40", cpg_frac := paste0(cpg_frac, "(2)")]
+
+setDT(data_input)[frag_grp == "320b_016C_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+setDT(data_output)[frag_grp == "320b_016C_50" & cpg_frac == "1/20", cpg_frac := paste0(cpg_frac, "(2)")]
+
+##Fix to the correct GC
+data_input$GC <- as.factor(str_sub(data_input$frag_grp,-2,-1))
+data_output$GC <- as.factor(str_sub(data_output$frag_grp,-2,-1))
+
+##input samples on miseq
+data_input$cpg_frac <- factor(data_input$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
+data_input_cleaned <- data_wrang(data_input)
+
+png("2019_input_miseq_plots.png", height = 10, width = 24, units = "in", res = 300)
+plot80_input <- dist_plots(as.data.frame(data_input_cleaned[1]), as.data.frame(data_input_cleaned[2])) +
+  ggtitle("Fragment length: 80 bp") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+plot160_input <- dist_plots(as.data.frame(data_input_cleaned[3]), as.data.frame(data_input_cleaned[4])) +
+  ggtitle("Fragment length: 160 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+plot320_input <- dist_plots(as.data.frame(data_input_cleaned[5]), as.data.frame(data_input_cleaned[6])) +
+  ggtitle("Fragment length: 320 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+mylegend <- g_legend(plot80_input)
+grid.arrange(arrangeGrob(plot80_input + theme(legend.position = "none"),
+                         plot160_input + theme(legend.position = "none"), ncol = 2, nrow = 1),
+                         arrangeGrob(plot320_input + theme(legend.position = "none"), ncol = 3.35,
+                         nrow = 1), mylegend, nrow = 2, heights = c(10, 1))
+dev.off()
+
+##output samples on miseq
+data_output$cpg_frac <- factor(data_output$cpg_frac, levels = c("1/80", "1/80(2)", "1/40", "1/40(2)", "1/20", "1/20(2)"))
+data_output_cleaned <- data_wrang(data_output)
+
+png("2019_output_miseq_plots.png", height = 10, width = 24, units = "in", res = 300)
+plot80_output <- dist_plots(as.data.frame(data_output_cleaned[1]), as.data.frame(data_output_cleaned[2])) +
+  ggtitle("Fragment length: 80 bp") +
+  theme(legend.position = "bottom", plot.title = element_text(size = 16, face = "bold")) +
+ scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+plot160_output <- dist_plots(as.data.frame(data_output_cleaned[3]), as.data.frame(data_output_cleaned[4])) +
+  ggtitle("Fragment length: 160 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+plot320_output <- dist_plots(as.data.frame(data_output_cleaned[5]), as.data.frame(data_output_cleaned[6])) +
+  ggtitle("Fragment length: 320 bp") +
+  theme(plot.title = element_text(size = 16, face = "bold")) +
+  scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000))
+mylegend <- g_legend(plot80_output)
+grid.arrange(arrangeGrob(plot80_output + theme(legend.position = "none"),
+                         plot160_output + theme(legend.position = "none"), ncol = 2, nrow = 1),
+                         arrangeGrob(plot320_output + theme(legend.position = "none"), ncol = 3.35,
+                         nrow = 1), mylegend, nrow = 2, heights = c(10, 1))
+dev.off()
+
+##Putting plots in order of what I want for publication
+png("2020_frag_GC_CpG_pubplts.png", height = 25, width = 20, units = "in", res = 300)
+mylegend <- g_legend(plot80_0.01)
+plots_pub <- grid.arrange(arrangeGrob(plot80_input + theme(legend.position = "none", axis.title.y = element_text("Reads")) +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000)),
+                                        plot160_input + theme(axis.title.y = element_blank(), legend.position = "none") +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), c(0, 10000, 20000, 30000, 40000, 50000)), ncol =2, nrow =1),
+                                        arrangeGrob(plot320_input + theme(axis.title.y = element_blank(), legend.position = "none") +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000)), ncol = 2, nrow = 1),
+                                        arrangeGrob(plot80_output + theme(legend.position = "none", axis.title.y = element_text("Reads")) +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000)),
+                                        plot160_output + theme(axis.title.y = element_blank(), legend.position = "none") +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), breaks = c(0, 10000, 20000, 30000, 40000, 50000)), ncol = 2, nrow = 1),
+                                        arrangeGrob(plot320_output + theme(axis.title.y = element_blank(), legend.position = "none") +
+                                                scale_y_continuous(labels = comma, limits = c(0, 50000), c(0, 10000, 20000, 30000, 40000, 50000)), ncol = 2, nrow =1),
+                                        arrangeGrob(plot80_0.01 + theme(legend.position = "none", axis.title.y = element_text("Reads")) +
+						scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 2500, 5000, 7500, 10000)),
+                                        plot160_0.01 + theme(axis.title.y = element_blank(), legend.position = "none") +
+						scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000)), ncol = 2, nrow = 1),
+                                        arrangeGrob(plot320_0.01 + theme(axis.title.y = element_blank(), legend.position = "none") +
+						 scale_y_continuous(labels = comma, limits = c(0, 20000), breaks = c(0, 5000, 10000, 15000, 20000)), ncol = 2, nrow = 1))
+dev.off()
+```
+
+The output of this script is figure 2 in the manuscript:
+
+#![Figure 2](/Users/samanthawilson/mordor-home/Projects/2020_spikein_hoffmangithub/2020spikein/figures/2020_figure2_GCfix.png)
+
+## **02_pmol_filtering_hexbin.R**
+
+This script assess the relationship between molar amount (picomoles) and mappability scores, and standard deviation.
+
+```{r, eval = FALSE}
+#!/usr/bin/env Rscript
+
+##load libraries
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(stringr)
+library(varhandle)
+library(forcats)
+library(purrr)
+library(stringi)
+library(tidyverse)
+library(scales)
+library(ggpubr)
+library(BlandAltmanLeh)
+library(cowplot)
+library(GGally)
+library(hexbin)
+library(RColorBrewer)
+library(Hmisc)
+
+##load data
+#data <- read.table("2020_intersect_fmol_mapability.bed")
+#colnames(data) <- c("chr_umap","start_umap","end_umap", "map_score", "chr", "start", "end", "overlap")
+
+##aggregate by window - mean mappability score
+#data$window <- as.factor(paste0(data$chr,"_", data$start, "_", data$end))
+#data_agg <- ddply(data,.(data$window, data$chr, data$start, data$end),numcolwise(mean), .progress = "text")
+#colnames(data_agg) <- c("window","chr", "start", "end", "start_umap", "end_umap", "map_score", "overlap")
+#print(head(data_agg))
+#print(dim(data_agg))
+#write.table(data_agg, header = TRUE, file = "2020_mappability_300bp_windows.csv")
+
+##aggregate by window - min mapability score
+#data$window <- as.factor(paste0(data$chr,"_", data$start, "_", data$end))
+#data_agg <- ddply(data,.(data$window, data$chr, data$start, data$end),numcolwise(min), .progress = "text")
+#colnames(data_agg) <- c("window","chr", "start", "end", "start_umap", "end_umap", "map_score", "overlap")
+#print(head(data_agg))
+#print(dim(data_agg))
+#write.table(data_agg, header = TRUE, file = "2020_min_mappability_300bp_windows.csv")
+
+mapp_windows <- read.csv("~/Annotations/2020_min_mappability_300bp_windows.csv", header = TRUE)
+mapp_windows$row.names <- NULL
+mapp_windows$X <- NULL
+
+##load in pmol data
+sample1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/S6547_all_pmol_hg38_intersect_adjbinned.bed", sep = "\t", header = TRUE)
+colnames(sample1) <- c("chr", "start", "end", "sample1_read_count", "sample1_pmol")
+sample1$window <- as.factor(paste0(sample1$chr,"_", sample1$start, "_", sample1$end))
+sample1 <- sample1[-c(1:3)]
+
+sample2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/S6548_all_pmol_hg38_intersect_adjbinned.bed", sep = "\t", header = TRUE)
+colnames(sample2) <- c("chr", "start", "end", "sample2_read_count", "sample2_pmol")
+sample2$window <- as.factor(paste0(sample2$chr,"_", sample2$start, "_", sample2$end))
+sample2 <- sample2[-c(1:3)]
+
+#merge all samples
+conc <- merge(sample1, sample2, by = "window", all = TRUE, fill = TRUE)
+
+print(head(conc))
+print(dim(conc))
+
+##merge with mappability data
+data_all <- merge(conc, mapp_windows, by = "window")
+data_all[is.na(data_all)] <- 0 #replace NA with 0 (this could be region was not methylated or was not picked up)
+
+##take mean between samples
+data_all$sample_mean <- (data_all$sample1_pmol + data_all$sample2_pmol) / 2
+print(head(data_all))
+print(dim(data_all))
+#5103552
+
+##ggplot2 theme 
+source("/cluster/home/wilsons/commonly_used_code/ggplot2_theme_bw.R")
+
+##plot function
+corr_plot <- function(means){
+ggplot(means, aes(x=map_score, y= sample_mean)) +
+  geom_point(color='#2980B9', size = 2) +
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE, color='#2C3E50') +
+  ylab("Picomole") +
+  xlab("Mappability score") +
+  stat_cor(method = "spearman") +
+  scale_y_continuous(labels = comma)
+}
+
+##Make plot
+png("2020_conc_mapp_corr.png", height = 6, width = 6, units = "in", res =300)
+corr_plot(data_all)
+dev.off()
+#cor -0.028
+
+###Plots with mean mappability score
+##Make ggplot hexbin plot
+png("2020_conc_mapp_corr_hexbin_morecounts.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_all$map_score, data_all$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_continuous(type = "viridis") +
+  labs(x = "Mappability score", y = "Picomoles", fill = "Log of counts") + 
+  scale_y_continuous(labels = comma)
+dev.off()
+
+##Looking into what the high fmol regions are
+### subset the windows that have > 5000fmol
+high_pmol <- subset(data_all, data_all$sample_mean > 1) 
+rownames(high_pmol) <- high_pmol$window
+#### 3 windows above 2pmol, 5 over 1 pmol
+
+### Are any of these regions on the ENCODE blacklist?
+repeats <- read.table("~/Annotations/2020_repeatregions_mappedto300bpwindows.bed", sep = "\t", header = FALSE)
+###subset to regions where there are overlaps between our windows
+repeats <- subset(repeats, repeats$V9>0)
+repeats <- repeats[,c(1:3)]
+colnames(repeats) <- c("chr","start","end")
+repeats$window <- paste0(repeats$chr,"_",repeats$start,"_",repeats$end)
+repeats <- unique(repeats)
+rownames(repeats) <-repeats$window
+
+blacklist <- read.table("~/Annotations/2020_new_ENCODE_blacklist.csv", sep = "\t", header = FALSE)
+colnames(blacklist) <- c("bl_chr", "bl_start", "bl_end", "chr", "start", "end", "overlap")
+blacklist$window <- paste0(blacklist$chr,"_",blacklist$start,"_",blacklist$end)
+blacklist <- unique(blacklist)
+
+overlap_repetitiveregions <- high_pmol[rownames(high_pmol) %in% rownames(repeats),]
+##Every single one is on the UCSC repetitive regions black list
+
+overlap_blacklist <- high_pmol[rownames(high_pmol) %in% rownames(blacklist),]
+
+##remove the blacklist regions and remake the hexbin plot.
+rm <- repeats$window
+rownames(data_all) <- data_all$window
+data_noblacklist <- data_all[!rownames(data_all) %in% rm,]
+
+rm <- blacklist$window
+data_noblacklist <- data_noblacklist[!rownames(data_noblacklist) %in% rm,]
+#4546731 windows
+
+png("2020_conc_mapp_corr_hexbin_noblacklist_morecounts.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_noblacklist$map_score, data_noblacklist$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_continuous(type = "viridis") +
+  labs(x = "Mappability score", y = "Picomoles", fill = "Log of counts") +
+  scale_y_continuous(labels = comma)
+dev.off()
+
+## Follow up on the high fmol sites not in the blacklist or  STR list
+high_pmol2 <- subset(data_noblacklist, data_noblacklist$sample_mean > 0.5)
+write.csv(high_pmol2, file = "2020_highpmol_noblacklist.csv")
+#117 windows
+
+###Plots with minimum mappability score
+##Make ggplot hexbin plot
+png("2020_conc_minmapp_corr_hexbin_morecounts.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_all$map_score, data_all$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_continuous(type = "viridis") +
+  labs(x = "Mappability score", y = "Femtomoles", fill = "Log of counts") +
+  scale_y_continuous(labels = comma)
+dev.off()
+
+##Looking into what the high fmol regions are
+### subset the windows that have > 5000fmol
+
+high_pmol <- subset(data_all, data_all$sample_mean > 1)
+rownames(high_pmol) <- high_pmol$window
+#### 5 windows, 3 on chromosome 16
+
+##remove the blacklist regions and remake the hexbin plot.
+rm <- repeats$window
+rownames(data_all) <- data_all$window
+data_noblacklist <- data_all[!rownames(data_all) %in% rm,]
+
+rm <- blacklist$window
+data_noblacklist <- data_noblacklist[!rownames(data_noblacklist) %in% rm,]
+
+png("2020_conc_minmapp_corr_hexbin_noblacklist_morecounts.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_noblacklist$map_score, data_noblacklist$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_continuous(type = "viridis") +
+  labs(x = "Mappability score", y = "Picomoles", fill = "Log of counts") +
+  scale_y_continuous(labels = comma)
+dev.off()
+
+## Follow up on the high fmol sites not in the blacklist or  STR list
+high_pmol2 <- subset(data_noblacklist, data_noblacklist$sample_mean > 0.5)
+write.csv(high_pmol2, file = "2020_highpmol_minmappability_noblacklist.csv")
+# 117 windows, most have high map scores
+
+##Hexbin plot with standard deviation
+data_noblacklist$sd <- apply(data_noblacklist[, c("sample1_pmol","sample2_pmol")],1,sd)
+
+png("2020_pmol_sd_corr.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_noblacklist$sd, data_noblacklist$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_continuous(type = "viridis") +
+  labs(x = "Standard deviation", y = "Picomoles", fill = "Log of counts") +
+  scale_y_continuous(labels = comma)
+dev.off()
+
+rm <- subset(data_noblacklist, data_noblacklist$sd > 0.05 | data_noblacklist$map_score < 0.5)
+data_filtered <- data_noblacklist[!rownames(data_noblacklist) %in% rownames(rm),]
+#4446375 windows 
+
+##Set up colour palette
+library(RColorBrewer)
+pal <- brewer.pal(n = 8, name = "Blues")[3:8]
+
+png("2020_pmol_sd_filtered_pubplt.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_filtered$sd, data_filtered$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+pmol_sd <- ggplot(gghex, aes(x = x, y = y, fill = count)) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_gradientn(colors = pal, breaks = c(0, 5, 10, 15,20), labels = c("0" , "5", "10", "15", "20")) +
+  labs(x = "Standard deviation", y = "Picomoles", fill = "Reads") +
+  scale_y_continuous(labels = comma)
+pmol_sd
+dev.off()
+
+
+##Redo hebin mappability without the sd
+png("2020_pmol_mapp_filtered_pubplt.png", height = 6, width = 6, units = "in", res =300)
+hex <- hexbin(data_filtered$map_score, data_filtered$sample_mean, 20)
+   gghex <- data.frame(hcell2xy(hex), count = log(hex@count),
+                        xo = hex@xcm, yo = hex@ycm)
+pmol_mapp <- ggplot(gghex, aes(x = x, y = y, fill = count) ) +
+  geom_hex(bins = 40, stat = "identity") +
+  scale_fill_gradientn(colors = pal,  breaks = c(0, 5, 10, 15,20), labels = c("0" , "5", "10", "15", "20")) +
+  labs(x = "Mappability score", y = "Picomoles", fill = "Reads") +
+  scale_y_continuous(labels = comma)
+pmol_mapp
+dev.off()
+
+##Extracting legend, so all plots are same size in the grid.arrange()
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend <- function(a_gplot) {
+  tmp <- ggplot_gtable(ggplot_build(a_gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+  }
+
+##Arranging plots together
+png("2020_pmol_sd_mapp_corr_pubplt.png", height =6, width = 12, units = "in", res =300)
+mylegend <- g_legend(pmol_sd) 
+grid.arrange(arrangeGrob(pmol_sd + theme(legend.position = "none")),
+		arrangeGrob(pmol_mapp + theme(legend.position = "none")), nrow = 1, mylegend)
+dev.off()
+
+##What are the highest pmol predictions
+high_pmol <- data_filtered[data_filtered$sample_mean > 0.25 & data_filtered$map_score < 1 | data_filtered$sample_mean > 0.7,] #11 windows
+write.csv(high_pmol, file = "2020_highpmol_minmappability_noblacklist.csv")
+```
+
+The output of this script is figure 3 in the manuscript:
+
+![Figure 3](/Users/samanthawilson/mordor-home/Projects/2020_spikein_hoffmangithub/2020spikein/figures/2020_figure3_hexbin_ctlproj_GCfix.png)
+
+## **03_mval_pmol_corr.R**
+
+This script correlated M-values from the Illumina EPIC array the our calculated molar amount (picomoles) and to raw read counts.
+
+```{r, eval = FALSE}
+#!/usr/bin/env Rscript
+
+#Load libraries
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(stringr)
+library(varhandle)
+library(forcats)
+library(purrr)
+library(stringi)
+library(tidyverse)
+#library(lumi)
+library(scales)
+library(ggpubr)
+
+#Load data
+
+##Predicted concentration metrics
+##load in pmol data
+sample1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/S6547_all_pmol_hg38_intersect_adjbinned.bed", sep = "\t", header = TRUE)
+colnames(sample1) <- c("chr", "start", "end", "sample1_read_count", "sample1_pmol")
+sample1$window <- as.factor(paste0(sample1$chr,"_", sample1$start, "_", sample1$end))
+sample1 <- sample1[-c(1:3)]
+
+sample2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_0.01ng_HCT116/S6548_all_pmol_hg38_intersect_adjbinned.bed", sep = "\t", header = TRUE)
+colnames(sample2) <- c("chr", "start", "end", "sample2_read_count", "sample2_pmol")
+sample2$window <- as.factor(paste0(sample2$chr,"_", sample2$start, "_", sample2$end))
+sample2 <- sample2[-c(1:3)]
+
+#merge all samples
+conc <- merge(sample1, sample2, by = "window", all = TRUE, fill = TRUE)
+rownames(conc) <- conc$window
+
+print(head(conc))
+print(dim(conc))
+
+epic <- read.delim("2019_HCT116_sesame_betas_windows.csv", sep = ",", header = TRUE)
+epic$X <- NULL
+epic$start <- NULL
+epic$end <- NULL
+epic$probepos <- NULL
+colnames(epic) <- c("window","Sample1","Sample2","Sample3")
+
+##Remove repetitive elements- simple repeats only 
+repeats <- read.table("~/Annotations/2020_repeatregions_mappedto300bpwindows.bed", sep = "\t", header = FALSE)
+###subset to regions where there are overlaps between our windows
+repeats <- subset(repeats, repeats$V9>0)
+repeats <- repeats[,c(1:3)]
+colnames(repeats) <- c("chr","start","end")
+repeats$window <- paste0(repeats$chr,"_",repeats$start,"_",repeats$end)
+repeats <- unique(repeats)
+rownames(repeats) <-repeats$window
+
+##remove repetitive regions from the data
+conc <- conc[!rownames(conc) %in% rownames(repeats),]
+
+##remove blacklist regions
+blacklist <- read.table("~/Annotations/2020_new_ENCODE_blacklist.csv", sep = "\t", header = FALSE)
+colnames(blacklist) <- c("bl_chr", "bl_start", "bl_end", "chr", "start", "end", "overlap")
+blacklist$window <- paste0(blacklist$chr,"_",blacklist$start,"_",blacklist$end)
+blacklist <- unique(blacklist)
+
+##remove blacklist regions
+conc <-conc[!rownames(conc) %in% blacklist$window,]
+
+## remove low mappability regions (mappability score<0.5)
+mappability <- read.csv("~/Annotations/2020_min_mappability_300bp_windows.csv", header = TRUE)
+mappability$X <- NULL
+
+mappability_0.5 <- subset(mappability, mappability$map_score<0.5)
+
+conc <- conc[!rownames(conc) %in% mappability_0.5$window,] 
+#4456768 windows
+
+#subset out samples with sd >0.05
+conc$sd <- apply(conc[, c("sample1_pmol","sample2_pmol")],1,sd)
+
+rm <- subset(conc, conc$sd > 0.05)
+conc <- conc[!rownames(conc) %in% rownames(rm),]
+#4455866
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- epic$window
+
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(epic) <- epic$window
+epic_subset <- subset(epic, rownames(epic) %in% rownames(conc))
+
+##mean the samples
+conc_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_pmol","sample2_pmol")]))
+epic_means <- data.frame(ID=epic_subset$window, Means=rowMeans(epic_subset[,c("Sample1","Sample2","Sample3")]))
+
+means <- merge(conc_means, epic_means, by = "ID")
+colnames(means) <- c("window","conc","epic")
+
+##changes betas to m-values
+means$epic_m <- log2(means$epic/(1-means$epic)) 
+
+##Correlation calculation
+cor.test(means$conc, means$epic_m, method = 'spearman')
+##0.1475338 
+
+conc[is.na(conc)] <- 0
+
+##ggplot2 theme 
+source("/cluster/home/wilsons/commonly_used_code/ggplot2_theme_bw.R")
+
+##plot function
+corr_plot <- function(means){
+ggplot(means, aes(x= epic_m, y= conc)) +
+  geom_point(color='#2980B9', size = 2) +
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE, color='#2C3E50') +
+  ylab("Picomoles") +
+  xlab("DNA methylation (M-value)") +
+  #stat_cor(method = "spearman", aes(label = paste(..r.label.., expression(paste("p < 2.2x",10^-16)), sep = "*`,`~")), digits = 2, r.digits = 2, r.accuracy = 0.01)+
+  scale_y_continuous(labels = comma)
+}
+
+##Plot
+png("2020_conc_epic_sesame_mapp_corr.png", height = 6, width = 6, units = "in", res =300)
+all_pts <- corr_plot(means)
+all_pts
+dev.off()
+
+
+##Correlate bins with >3 CpG represented on array
+##Let's correlate those this more than 3 cpg present in window
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg3.csv", row.names = 1, header = TRUE)
+#50053 windows
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+rownames(conc) <- conc$window
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc))
+
+##mean the samples
+conc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_pmol","sample2_pmol")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(conc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","conc","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$conc, high_means$epic_m, method = 'spearman')
+##0.6239577  - with 3 CpG and 50053 windows
+
+##Full plot
+png("2020_conc_epicsesame_corr_mapp_morethan3CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more3cpg <- corr_plot(high_means) + 
+                 scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) + 
+                 scale_y_continuous(limits = c(0,10), breaks = c(0, 2, 4, 6, 8, 10))
+corr_more3cpg 
+dev.off()
+
+##Let's correlate those this more than 5 cpg present in window
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg5.csv", row.names = 1, header = TRUE)
+#12602 windows
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+rownames(conc) <- conc$window
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc))
+
+##mean the samples
+conc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_pmol","sample2_pmol")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(conc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","conc","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$conc, high_means$epic_m, method = 'spearman')
+##0.8007208    - with more than 5 CpG and 12602 windows
+
+##Full plot
+png("2020_conc_epicsesame_corr_mapp_morethan5CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more5cpg <- corr_plot(high_means) +
+                 scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+scale_y_continuous(limits = c(0,10), breaks = c(0, 2, 4, 6, 8, 10))
+corr_more5cpg
+dev.off()
+
+### 7 CpG
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg7.csv", row.names = 1, header = TRUE)
+#3567 windows
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+rownames(conc) <- conc$window
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc))
+
+##mean the samples
+conc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_pmol","sample2_pmol")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(conc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","conc","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$conc, high_means$epic_m, method = 'spearman')
+##0.8206853   - with more than 7 CpG and 3567 windows
+
+##Full plot
+png("2020_conc_epicsesame_corr_mapp_morethan7CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more7cpg <- corr_plot(high_means) +
+  scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+scale_y_continuous(limits = c(0,10), breaks = c(0, 2, 4, 6, 8, 10))
+corr_more7cpg
+dev.off()
+
+###10 CpG
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg10.csv", row.names = 1, header = TRUE)
+#294 windows
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+rownames(conc) <- conc$window
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc))
+
+##mean the samples
+conc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_pmol","sample2_pmol")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(conc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","conc","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$conc, high_means$epic_m, method = 'spearman')
+##0.8703139    - with more than 10 CpG and 294 windows
+
+##Full plot
+png("2020_conc_epicsesame_corr_mapp_morethan10CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more10cpg <- corr_plot(high_means) +
+  scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+scale_y_continuous(limits = c(0,10), breaks = c(0, 2, 4, 6, 8, 10))
+corr_more10cpg
+dev.off()
+
+#### Correlation of read counts to M-values
+##mean the samples
+rc_means <- data.frame(ID=conc$window, Means=rowMeans(conc[,c("sample1_read_count","sample2_read_count")]))
+epic_means <- data.frame(ID=epic_subset$window, Means=rowMeans(epic_subset[,c("Sample1","Sample2","Sample3")]))
+
+means <- merge(rc_means, epic_means, by = "ID")
+colnames(means) <- c("window","readcount","epic")
+
+##changes betas to m-values
+means$epic_m <- log2(means$epic/(1-means$epic))
+print(head(means))
+
+###Change corr_plot function so that y is readcounts
+corr_plot <- function(data){
+ggplot(data, aes(x= epic_m, y= readcounts)) +
+  geom_point(color='#2980B9', size = 2) +
+  geom_smooth(method=lm, se=FALSE, fullrange=TRUE, color='#2C3E50') +
+  ylab("Reads") +
+  xlab("DNA methylation (M-value)") +
+  #stat_cor(method = "spearman", aes(label = paste(..r.label.., expression(paste("p < 2.2x",10^-16)), sep = "*`,`~")), digits = 2, r.digits = 2) +
+  scale_y_continuous(labels = comma)
+}
+
+
+##Correlate bins with >3 CpG represented on array
+##Let's correlate those this more than 3 cpg present in window
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg3.csv", row.names = 1, header = TRUE)
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc_subset))
+
+##mean the samples
+rc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_read_count","sample2_read_count")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(rc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","readcounts","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$readcounts, high_means$epic_m, method = 'spearman')
+##0.6203779  
+
+##Full plot
+png("2020_readcounts_epicsesame_corr_mapp_morethan3CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more3cpg_rc <- corr_plot(high_means) +
+	scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) + 
+        scale_y_continuous(limits = c(0,500), breaks = c(0, 100, 200, 300, 400, 500))
+corr_more3cpg_rc
+dev.off()
+
+##Let's correlate those this more than 5 cpg present in window
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg5.csv", row.names = 1, header = TRUE)
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc_subset))
+
+##mean the samples
+rc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_read_count","sample2_read_count")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(rc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","readcounts","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$readcounts, high_means$epic_m, method = 'spearman')
+## 0.8138254
+
+##Full plot
+png("2020_readcounts_epicsesame_corr_mapp_morethan5CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more5cpg_rc <- corr_plot(high_means) +
+        scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+        scale_y_continuous(limits = c(0,500), breaks = c(0, 100, 200, 300, 400, 500))
+corr_more5cpg_rc
+dev.off()
+
+###Correlate read counts with >7cpg
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg7.csv", row.names = 1, header = TRUE)
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc_subset))
+
+##mean the samples
+rc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_read_count","sample2_read_count")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(rc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","readcounts","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$readcounts, high_means$epic_m, method = 'spearman')
+##0.8461799
+
+##Full plot
+png("2020_readcounts_epicsesame_corr_mapp_morethan7CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more7cpg_rc <- corr_plot(high_means) +
+        scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+scale_y_continuous(limits = c(0,500), breaks = c(0, 100, 200, 300, 400, 500))
+corr_more7cpg_rc
+dev.off()
+
+###>10 cpgs
+high_cpg <- read.csv("2020_HCT116_sesame_betas_windows_highcpg10.csv", row.names = 1, header = TRUE)
+
+high_cpg$CpG_beg <- NULL
+high_cpg$CpG_end <- NULL
+colnames(high_cpg) <- c("window","Sample1","Sample2","Sample3")
+
+##subset conc and epic to only those windows present in both
+windows_of_interest <- high_cpg$window
+
+conc_subset <- subset(conc, rownames(conc) %in% windows_of_interest)
+
+rownames(high_cpg) <- high_cpg$window
+high_subset <- subset(high_cpg, rownames(high_cpg) %in% rownames(conc_subset))
+
+##mean the samples
+rc_high_means <- data.frame(ID=conc_subset$window, Means=rowMeans(conc_subset[,c("sample1_read_count","sample2_read_count")]))
+epic_high_means <- data.frame(ID=high_subset$window, Means=rowMeans(high_subset[,c("Sample1","Sample2","Sample3")]))
+
+high_means <- merge(rc_high_means, epic_high_means, by = "ID")
+colnames(high_means) <- c("window","readcounts","epic")
+high_means$epic_m <- log2(high_means$epic/(1-high_means$epic))
+
+##Correlation calculation
+cor.test(high_means$readcounts, high_means$epic_m, method = 'spearman')
+##0.877321 
+
+##Full plot
+png("2020_readcounts_epicsesame_corr_mapp_morethan10CpG.png", height = 6, width = 6, units = "in", res =300)
+corr_more10cpg_rc <- corr_plot(high_means) +
+        scale_x_continuous(limits = c(-8, 8), breaks = c(-6, -4, -2, 0, 2, 4, 6)) +
+scale_y_continuous(limits = c(0,500), breaks = c(0, 100, 200, 300, 400, 500))
+corr_more10cpg_rc
+dev.off()
+
+##Read count and pmol
+##y axis cut to 500 in read counts, this does cut some of the points off, but looks cleaners. The correlations reported are for all points. 
+png("2020_pmol_readcounts_sesamemval_corr_mapp_allplts.png", height = 12, width = 8, units = "in", res = 300)
+all_rc_corr_plot <- grid.arrange(arrangeGrob(corr_more3cpg + scale_y_continuous(limits=c(0,0.5)) + theme(axis.title.x = element_blank()), top = grid::textGrob("≥ 3 CpG/300 bp window (N = 34,735 windows)", x = 0.6, hjust =0)),
+			    arrangeGrob(corr_more3cpg_rc + scale_y_continuous(limits=c(0,500)) + theme(axis.title.x = element_blank()), top = ""),
+                            arrangeGrob(corr_more5cpg + scale_y_continuous(limits=c(0,0.5)) + theme(axis.title.x = element_blank()), top = grid::textGrob("≥ 5 CpG/300 bp window (N = 7,203 windows)", x = 0.6, hjust = 0)),
+			    arrangeGrob(corr_more5cpg_rc + scale_y_continuous(limits=c(0,500)) + theme(axis.title.x = element_blank()), top = ""),
+                            arrangeGrob(corr_more7cpg + scale_y_continuous(limits=c(0,0.5)) + theme(axis.title.x = element_blank()), top = grid::textGrob("≥ 7 CpG/300 bp window (N = 1,898 windows)", x = 0.6, hjust = 0)),
+			    arrangeGrob(corr_more7cpg_rc + scale_y_continuous(limits=c(0,500)) + theme(axis.title.x = element_blank()), top =""),
+			    arrangeGrob(corr_more10cpg + scale_y_continuous(limits=c(0,0.5)) + theme(axis.title.x = element_blank()), top = grid::textGrob("≥ 10 CpG/300 bp window (N = 147 windows)", x =0.6, hjust = 0)),
+                            arrangeGrob(corr_more10cpg_rc + theme(axis.title.x = element_blank()), top = ""), ncol =2)
+
+annotate_figure(all_rc_corr_plot,
+               bottom = text_grob("DNA methylation (M-value)", color = "black",
+                                   size = 16))
+dev.off()
+```
+
+The output of this script is figure 4 in the manuscript:
+
+![Figure 4](/Users/samanthawilson/mordor-home/Projects/2020_spikein_hoffmangithub/2020spikein/figures/2020_figure4_corr_ctlkproj_GCfix.png) 
+
+## **04_PrincipalComponents_Batches.R**
+
+The scripts normalizes raw read count data with [QSEA]().
+
+The script subsequently performs principal component analyis on raw read counts, QSEA normalized counts, molar amount (picomoles), and molar amount (picomoles) filtered to our suggested sites.
+Each principal component is correlated to known variables within the data.
+
+```{r, eval = FALSE}
+#!/usr/bin/env Rscript
+
+##Load needed packages
+
+library("qsea")
+library("BSgenome")
+library("BSgenome.Hsapiens.UCSC.hg38")
+BSgenome= "BSgenome.Hsapiens.UCSC.hg38"
+library(ggplot2)
+library(gridExtra)
+library(ggpubr)
+library(scales)
+library(stringr)
+library(cowplot)
+library(reshape2)
+library(plyr)
+library(compute.es)
+library(grid)
+library(tidyvers)
+
+###Heat-scree plots are adapted from:
+#### De Souza, Rebecca AG, et al. "DNA methylation profiling in human Huntington's disease brain." Human molecular genetics 25.10 (2016): 2013-2030.
+
+##ggplot2 theme 
+source("/cluster/home/wilsons/commonly_used_code/ggplot2_theme_bw.R")
+
+#Bam files for this project
+PATH_PREFIX_B1 <- "/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/"
+BamsList_B1 <- list.files(path=PATH_PREFIX_B1, pattern = "filtered_human.*dedup.bam")
+bamFile_B1 <- data.frame(paste0(PATH_PREFIX_B1,BamsList_B1))
+colnames(bamFile_B1) <- "file_name"
+
+PATH_PREFIX_B2 <- "/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/"
+BamsList_B2 <- list.files(path=PATH_PREFIX_B2, pattern = "filtered_human.*dedup.bam")
+bamFile_B2 <- data.frame(paste0(PATH_PREFIX_B2,BamsList_B2))
+colnames(bamFile_B2) <- "file_name"
+
+PATH_PREFIX_B3 <- "/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/"
+BamsList_B3 <- list.files(path=PATH_PREFIX_B3, pattern = "filtered_human.*dedup.bam")
+bamFile_B3 <- data.frame(paste0(PATH_PREFIX_B3,BamsList_B3))
+colnames(bamFile_B3) <- "file_name"
+
+bamFile <- rbind(bamFile_B1, bamFile_B2, bamFile_B3)
+
+#Create Qsea set for each sample and bind together in a list
+sample_table = data.frame(sample_name = paste0("sample_", 1:15), file_name = bamFile$file_name, group = c(rep("B1",5), rep("B2", 5), rep ("B3", 5)), stringsAsFactors = FALSE) 
+	
+#Defining parameters again
+BSgenome="BSgenome.Hsapiens.UCSC.hg38"
+ws=300
+chr.select=paste0("chr",1:22)
+	
+#Create Qsea set for each sample, this will be combined with the other sample MEDIPS set into a list
+qseaSet = createQseaSet(sampleTable = sample_table, BSgenome = BSgenome, window_size = ws, chr.select = chr.select)
+qseaSet = addCoverage(qseaSet, uniquePos = TRUE, paired = TRUE)
+qseaSet = addPatternDensity(qseaSet, "CG", name = "CpG", fragment_length = 300)
+qseaSet=addLibraryFactors(qseaSet)
+qseaSet = addOffset(qseaSet, enrichmentPattern = "CpG")
+
+str(qseaSet)#Check that SetCreated.list is infact a list of N (number of samples in data set) MEDIPS sets
+
+#Specify the shortened sample names here
+save(qseaSet, file = "2020_allbatches_QseaSets.RData")#save the MEDIPS sets
+
+###Load in the pmol data and merge together
+###Batch 1
+S1_B1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/filtered_human.aligned.unalignedtospike.trimmed.6654_S1_L002_R1_001.fastq.1unalignedtospike.trimmed.6654_S1_L002_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S1_B1) <- c("chr", "start", "end", "S1B1_read_count", "S1B1_pmol")
+S1_B1$window <- paste0(S1_B1$chr,"_",S1_B1$start,"_",S1_B1$end)
+S1_B1 <- S1_B1[-c(1:3)]
+S1_B1 <- S1_B1 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S2_B1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/filtered_human.aligned.unalignedtospike.trimmed.6655_S2_L002_R1_001.fastq.1unalignedtospike.trimmed.6655_S2_L002_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S2_B1) <- c("chr", "start", "end", "S2B1_read_count", "S2B1_pmol")
+S2_B1$window <- paste0(S2_B1$chr,"_",S2_B1$start,"_",S2_B1$end)
+S2_B1 <- S2_B1[-c(1:3)]
+S2_B1 <- S2_B1 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S3_B1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/filtered_human.aligned.unalignedtospike.trimmed.6656_S3_L002_R1_001.fastq.1unalignedtospike.trimmed.6656_S3_L002_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S3_B1) <- c("chr", "start", "end", "S3B1_read_count", "S3B1_pmol")
+S3_B1$window <- paste0(S3_B1$chr,"_",S3_B1$start,"_",S3_B1$end)
+S3_B1 <- S3_B1[-c(1:3)]
+S3_B1 <- S3_B1 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S4_B1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/filtered_human.aligned.unalignedtospike.trimmed.6657_S4_L002_R1_001.fastq.1unalignedtospike.trimmed.6657_S4_L002_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S4_B1) <- c("chr", "start", "end", "S4B1_read_count", "S4B1_pmol")
+S4_B1$window <- paste0(S4_B1$chr,"_",S4_B1$start,"_",S4_B1$end)
+S4_B1 <- S4_B1[-c(1:3)]
+S4_B1 <- S4_B1 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S5_B1 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch1_RS/filtered_human.aligned.unalignedtospike.trimmed.6658_S5_L002_R1_001.fastq.1unalignedtospike.trimmed.6658_S5_L002_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S5_B1) <- c("chr", "start", "end", "S5B1_read_count", "S5B1_pmol")
+S5_B1$window <- paste0(S5_B1$chr,"_",S5_B1$start,"_",S5_B1$end)
+S5_B1 <- S5_B1[-c(1:3)]
+S5_B1 <- S5_B1 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+#merge samples together
+batch1 <- merge(S1_B1, S2_B1, by = "window", all = TRUE, fill = TRUE)
+batch1 <- merge(batch1, S3_B1, by = "window", all = TRUE, fill = TRUE)
+batch1 <- merge(batch1, S4_B1,  by = "window", all = TRUE, fill = TRUE)
+batch1 <- merge(batch1, S5_B1, by = "window", all = TRUE, fill = TRUE)
+
+###Batch2
+S1_B2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/filtered_human.aligned.unalignedtospike.trimmed.JB_A29_S11_L001_R1_001.fastq.1unalignedtospike.trimmed.JB_A29_S11_L001_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S1_B2) <- c("chr", "start", "end", "S1B2_read_count", "S1B2_pmol")
+S1_B2$window <- paste0(S1_B2$chr,"_",S1_B2$start,"_",S1_B2$end)
+S1_B2 <- S1_B2[-c(1:3)]
+S1_B2 <- S1_B2 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S2_B2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/filtered_human.aligned.unalignedtospike.trimmed.JB_A35_S12_L001_R1_001.fastq.1unalignedtospike.trimmed.JB_A35_S12_L001_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S2_B2) <- c("chr", "start", "end", "S2B2_read_count", "S2B2_pmol")
+S2_B2$window <- paste0(S2_B2$chr,"_",S2_B2$start,"_",S2_B2$end)
+S2_B2 <- S2_B2[-c(1:3)]
+S2_B2 <- S2_B2 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S3_B2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/filtered_human.aligned.unalignedtospike.trimmed.JB_A37_S13_L001_R1_001.fastq.1unalignedtospike.trimmed.JB_A37_S13_L001_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S3_B2) <- c("chr", "start", "end", "S3B2_read_count", "S3B2_pmol")
+S3_B2$window <- paste0(S3_B2$chr,"_",S3_B2$start,"_",S3_B2$end)
+S3_B2 <- S3_B2[-c(1:3)]
+S3_B2 <- S3_B2 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S4_B2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/filtered_human.aligned.unalignedtospike.trimmed.JB_A56_S14_L001_R1_001.fastq.1unalignedtospike.trimmed.JB_A56_S14_L001_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S4_B2) <- c("chr", "start", "end", "S4B2_read_count", "S4B2_pmol")
+S4_B2$window <- paste0(S4_B2$chr,"_",S4_B2$start,"_",S4_B2$end)
+S4_B2 <- S4_B2[-c(1:3)]
+S4_B2 <- S4_B2 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S5_B2 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch2_JB/filtered_human.aligned.unalignedtospike.trimmed.JB_A64_S15_L001_R1_001.fastq.1unalignedtospike.trimmed.JB_A64_S15_L001_R1_001.fastq.2_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S5_B2) <- c("chr", "start", "end", "S5B2_read_count", "S5B2_pmol")
+S5_B2$window <- paste0(S5_B2$chr,"_",S5_B2$start,"_",S5_B2$end)
+S5_B2 <- S5_B2[-c(1:3)]
+S5_B2 <- S5_B2 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+#merge samples together
+batch2 <- merge(S1_B2, S2_B2, by = "window", all = TRUE, fill = TRUE)
+batch2 <- merge(batch2, S3_B2, by = "window", all = TRUE, fill = TRUE)
+batch2 <- merge(batch2, S4_B2,  by = "window", all = TRUE, fill = TRUE)
+batch2 <- merge(batch2, S5_B2, by = "window", all = TRUE, fill = TRUE)
+
+##Batch3
+S1_B3 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/filtered_human.aligned.unalignedtospike.trimmed.SWID_16386952_TGL54_0001_Ct_T_PE_317_CM_A29_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S1_B3) <- c("chr", "start", "end", "S1B3_read_count", "S1B3_pmol")
+S1_B3$window <- paste0(S1_B3$chr,"_",S1_B3$start,"_",S1_B3$end)
+S1_B3 <- S1_B3[-c(1:3)]
+S1_B3 <- S1_B3 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S2_B3 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/filtered_human.aligned.unalignedtospike.trimmed.SWID_16386954_TGL54_0003_Ct_T_PE_316_CM_A37_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S2_B3) <- c("chr", "start", "end", "S2B3_read_count", "S2B3_pmol")
+S2_B3$window <- paste0(S2_B3$chr,"_",S2_B3$start,"_",S2_B3$end)
+S2_B3 <- S2_B3[-c(1:3)]
+S2_B3 <- S2_B3 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S3_B3 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/filtered_human.aligned.unalignedtospike.trimmed.SWID_16386956_TGL54_0002_Ct_T_PE_309_CM_A35_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S3_B3) <- c("chr", "start", "end", "S3B3_read_count", "S3B3_pmol")
+S3_B3$window <- paste0(S3_B3$chr,"_",S3_B3$start,"_",S3_B3$end)
+S3_B3 <- S3_B3[-c(1:3)]
+S3_B3 <- S3_B3 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S4_B3 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/filtered_human.aligned.unalignedtospike.trimmed.SWID_16386958_TGL54_0004_Ct_T_PE_310_CM_A56_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S4_B3) <- c("chr", "start", "end", "S4B3_read_count", "S4B3_pmol")
+S4_B3$window <- paste0(S4_B3$chr,"_",S4_B3$start,"_",S4_B3$end)
+S4_B3 <- S4_B3[-c(1:3)]
+S4_B3 <- S4_B3 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+S5_B3 <- read.table("/cluster/projects/hoffmangroup/data_samanthawilson/2020_Batch3_DT/filtered_human.aligned.unalignedtospike.trimmed.SWID_16386960_TGL54_0005_Ct_T_PE_309_CM_A64_sorted_dedup_sort_cut_CG_all_pmol_hg38_intersect_adjbinned.bed", header =T)
+colnames(S5_B3) <- c("chr", "start", "end", "S5B3_read_count", "S5B3_pmol")
+S5_B3$window <- paste0(S5_B3$chr,"_",S5_B3$start,"_",S5_B3$end)
+S5_B3 <- S5_B3[-c(1:3)]
+S5_B3 <- S5_B3 %>%  group_by(window) %>% summarise_if(is.numeric, sum)
+
+#merge samples together
+batch3 <- merge(S1_B3, S2_B3, by = "window", all = TRUE, fill = TRUE)
+batch3 <- merge(batch3, S3_B3, by = "window", all = TRUE, fill = TRUE)
+batch3 <- merge(batch3, S4_B3,  by = "window", all = TRUE, fill = TRUE)
+batch3 <- merge(batch3, S5_B3, by = "window", all = TRUE, fill = TRUE)
+
+#merge batches together
+data <- merge(batch1, batch2, by = "window", all = TRUE, fill = TRUE)
+data <- merge(data, batch3, by = "window", all = TRUE, fill = TRUE)
+data[is.na(data)] <- 0
+data$window <- as.factor(data$window)
+
+data_raw <- data[-c(3,5,7,9,11,13,15,17,19,21,23,25,27,29,31)]
+data_pmol <- data[-c(2,4,6,8,10,12,14,16,18,20,22,24,26,28,30)]
+data_pmol_raw <- data[-c(2,4,6,8,10,12,14,16,18,20,22,24,26,28,30)]
+
+#Missing <- lapply(data_pmol_raw, function(x){ length(which(x==0))/length(x)})
+
+##Remove repetitive elements- simple repeats only 
+repeats <- read.table("~/Annotations/2020_repeatregions_mappedto300bpwindows.bed", sep = "\t", header = FALSE)
+###subset to regions where there are overlaps between our windows
+repeats <- subset(repeats, repeats$V9>0)
+repeats <- repeats[,c(1:3)]
+colnames(repeats) <- c("chr","start","end")
+repeats$window <- paste0(repeats$chr,"_",repeats$start,"_",repeats$end)
+repeats <- unique(repeats)
+rownames(repeats) <-repeats$window
+
+##remove repetitive regions from the fmol data
+rownames(data_pmol) <- data_pmol$window
+data_pmol <- data_pmol[!rownames(data_pmol) %in% rownames(repeats),]
+
+##remove blacklist regions
+blacklist <- read.table("~/Annotations/2020_new_ENCODE_blacklist.csv", sep = "\t", header = FALSE)
+colnames(blacklist) <- c("bl_chr", "bl_start", "bl_end", "chr", "start", "end", "overlap")
+blacklist$window <- paste0(blacklist$chr,"_",blacklist$start,"_",blacklist$end)
+blacklist <- unique(blacklist)
+
+##remove blacklist regions from fmol
+data_pmol <- data_pmol[!rownames(data_pmol) %in% blacklist$window,]
+
+## remove low mappability regions (mappability score<0.5)
+mappability <- read.csv("~/Annotations/2020_min_mappability_300bp_windows.csv", header = TRUE)
+mappability$X <- NULL
+
+mappability_0.5 <- subset(mappability, mappability$map_score<0.5)
+
+data_pmol <- data_pmol[!rownames(data_pmol) %in% mappability_0.5$window,]
+
+##Infer sex from Y signal in raw data
+chrY_reads <- subset(data_raw, str_detect(data_raw$window, pattern = "chrY") == "TRUE")
+chrY_reads[is.na(chrY_reads)] <- 0
+no_chrY <- lapply(chrY_reads, function(x){ length(which(x==0))/length(x)})
+
+###Heat scree effect size
+source("/cluster/home/wilsons/commonly_used_code/heatscree_cohensd_plot.R")
+
+Loadings_meta <- data.frame(batch = as.factor(c(rep("Batch_1", 5), rep("Batch_2", 5), rep("Batch_3", 5))),
+                            sample = rep(c("sample_1", "sample_2", "sample_3", "sample_4", "sample_5"),3),
+                            sequencer = as.factor(c(rep("A",5), rep("A", 5), rep("B", 5))),
+                            adapters = as.factor(c(rep("A",5), rep("B",5), rep("A",5))),
+                            sex = as.factor(rep(c("F","F","M","M","F"),3)))
+                            #NPM1 = as.factor(rep(c("pos", "pos", "pos", "neg", "neg"),3)),
+                            #FLT3_ITD = as.factor(rep(c("pos", "neg", "neg", "neg", "neg"),3)),
+                            #IDH1 = as.factor(rep(c("neg", "pos", "pos", "neg", "neg"),3)),
+                            #IDH2 = as.factor(rep(c("pos", "neg", "neg", "neg", "neg"),3)),
+                            #TET2 = as.factor(rep(c("neg", "neg", "neg", "pos", "pos"),3)))
+
+# Specifiy the number of PCs you want shown
+Num<-9 # should be equal to the number of samples in your dataset; for large datasets, you can opt to just see the top PCs
+# Designate what order you want the variables to appear (continuous variables rbinded to categorical variables in function)
+Order<-c(1,2,3,4,5)
+
+meta_categorical <- Loadings_meta[,c("batch","sequencer","adapters","sample", "sex")]  # input column numbers in meta that contain categorical variables
+colnames(meta_categorical) <- c("Batch","Unmethylated filler", "Adapters", "Sample", "Sex")
+meta_categorical$Sample <- as.factor(meta_categorical$Sample)
+
+##QSEA
+pca <- prcomp(t(qseaSet@count_matrix))
+vars <- pca$sdev^2
+Importance <- vars/sum(vars)
+
+Loadings <- as.data.frame(pca$x)
+
+##QSEA plot
+png("2020_heatscree_meand_qsea.png", height = 6, width = 12 , unit = "in", res =300)
+qsea <- heat_scree_plot_es(Loadings, Importance, Num, Order) + theme(legend.position = "none")
+qsea
+dev.off()
+
+Loadings_qsea <- Loadings
+
+##pmol filtered
+pca_dat <- data_pmol
+pca_dat[is.na(pca_dat)] <- 0
+rownames(pca_dat) <- pca_dat$window
+pca_dat$window <- NULL
+pca <- prcomp(t(pca_dat))
+vars <- pca$sdev^2
+Importance <- vars/sum(vars) ##3% of variance associated with batch
+
+Loadings <- as.data.frame(pca$x)
+
+##pmol filtered plot
+png("2020_heatscree_meand_pmolfiltered.png", height = 12, width =12 , unit = "in", res =300)
+pmol <- heat_scree_plot_es(Loadings, Importance, Num, Order) + theme(legend.position = "none")
+pmol
+dev.off()
+
+Loadings_pmol <- Loadings
+
+##Raw data
+pca_dat <- data_raw
+pca_dat[is.na(pca_dat)] <- 0
+rownames(pca_dat) <- pca_dat$window
+pca_dat$window <- NULL
+pca <- prcomp(t(pca_dat))
+vars <- pca$sdev^2
+Importance <- vars/sum(vars)
+
+Loadings <- as.data.frame(pca$x)
+
+png("2020_heatscree_meand_raw.png", height = 12, width =12 , unit = "in", res =300)
+raw <- heat_scree_plot_es(Loadings, Importance, Num, Order) + theme(legend.position = "none")
+raw
+dev.off()
+
+Loadings_raw <- Loadings
+
+##pmol not filtered
+pca_dat <- data_pmol_raw
+pca_dat[is.na(pca_dat)] <- 0
+rownames(pca_dat) <- pca_dat$window
+pca_dat$window <- NULL
+pca <- prcomp(t(pca_dat))
+vars <- pca$sdev^2
+Importance <- vars/sum(vars)
+
+Loadings <- as.data.frame(pca$x)
+
+png("2020_heatscree_meand_allwindows_fmol.png", height = 12, width =12 , unit = "in", res =300)
+pmol_raw <- heat_scree_plot_es(Loadings, Importance, Num, Order) + theme(legend.position = "none")
+pmol_raw
+dev.off()
+
+Loadings_pmol_raw <- Loadings
+
+png("2020_Heatscree_allbatches_meand_pmolandpmolnoblacklist.png", height = 24, width = 12, units = "in", res =300)
+grid.arrange(arrangeGrob(raw + theme(legend.position = "none", axis.title.x = element_text("")),
+        arrangeGrob(qsea + theme(legend.position = "none", axis.title.x = element_text(""))),
+        arrangeGrob(pmol_raw  + theme(legend.position = "none", axis.title.x = element_text(""))),
+        arrangeGrob(pmol  + theme(legend.position = "none", axis.title.x = element_text(""))), ncol = 1))
+dev.off()
+
+
+### How much of the batch effects aka PC5 are driven by repeat regions?
+repeat_masker <- read.table("~/2020_RepeatMasker_300bp.bed", sep = "\t", header = FALSE)
+colnames(repeat_masker) <- c("repeat_chr", "repeat_start", "repeat_end", "element", "number", "strand", "chr", "start", "end", "overlap")
+repeat_masker$window <- paste0(repeat_masker$chr,"_", repeat_masker$start,"_", repeat_masker$end)
+
+pca_dat <- data_pmol
+pca_dat[is.na(pca_dat)] <- 0
+rownames(pca_dat) <- pca_dat$window
+pca_dat$window <- NULL
+pca <- prcomp(t(pca_dat))
+vars <- pca$sdev^2
+Importance <- vars/sum(vars)
+
+##PC3
+rotations <- as.data.frame(pca$rotation)
+rotations_PC3 <- as.data.frame(rotations$PC3)
+rownames(rotations_PC3) <- rownames(rotations)
+rotations_PC3 <- abs(rotations_PC3)
+colnames(rotations_PC3) <- c("PC3")
+rotations_PC3$window <- rownames(rotations_PC3)
+rotations_PC3 <- as.data.frame(rotations_PC3[order(-rotations_PC3$PC3),])
+
+PC3_top <- as.data.frame(rotations_PC3[1:(round(0.1*nrow(rotations_PC3))),])
+
+##how many of top 10% of drivers of PC5 are repeat regions?
+sum(rownames(PC3_top) %in% repeat_masker$window)/(nrow(PC3_top)) #71%
+driving_repeats <- repeat_masker[repeat_masker$window %in% rownames(PC3_top),]
+sum(driving_repeats$element == "Alu*")
+nrow(driving_repeats[grep("Alu*", driving_repeats$element),])/ nrow(driving_repeats) ##0.42 are Alu
+summary(driving_repeats$element)
+
+##PC5
+rotations <- as.data.frame(pca$rotation)
+rotations_PC5 <- as.data.frame(rotations$PC5)
+rownames(rotations_PC5) <- rownames(rotations)
+rotations_PC5 <- abs(rotations_PC5)
+colnames(rotations_PC5) <- c("PC5")
+rotations_PC5$window <- rownames(rotations_PC5)
+rotations_PC5 <- as.data.frame(rotations_PC5[order(-rotations_PC5$PC5),])
+
+PC5_top <- as.data.frame(rotations_PC5[1:(round(0.1*nrow(rotations_PC5))),])
+
+##how many of top 10% of drivers of PC5 are repeat regions?
+sum(rownames(PC5_top) %in% repeat_masker$window)/(nrow(PC5_top)) #0.7227874, so 72% of drivers in batch are in repetitive regions
+driving_repeats <- repeat_masker[repeat_masker$window %in% rownames(PC5_top),]
+sum(driving_repeats$element == "Alu*")
+nrow(driving_repeats[grep("Alu*", driving_repeats$element),])/ nrow(driving_repeats) ##0.43 are Alu
+```
+
+The output of this script is figure 5 in the manuscript:
+
+![Figure 5](/Users/samanthawilson/mordor-home/Projects/2020_spikein_hoffmangithub/2020spikein/figures/2020_figure5_heatscree_GCfix.png) 
